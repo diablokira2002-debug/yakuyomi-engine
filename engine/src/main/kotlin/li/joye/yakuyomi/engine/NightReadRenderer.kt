@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import li.joye.yakuyomi.nightread.Gray
 import li.joye.yakuyomi.nightread.Mask
 import li.joye.yakuyomi.nightread.NightRead
+import li.joye.yakuyomi.nightread.NightReadDebug
 import li.joye.yakuyomi.nightread.NightReadInput
 import li.joye.yakuyomi.nightread.NightReadParams
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
@@ -53,6 +54,15 @@ class NightReadStats {
     var renderMs = 0L
     /** 頁超過 [NightReadRenderer.MAX_PIXELS] 時縮到的尺寸 (w, h)；沒縮＝null。縮圖本身的時間不計入三段。 */
     var scaledTo: Pair<Int, Int>? = null
+    /**
+     * [NightRead.render] 各段耗時（ms，依完成順序），只列 ≥ [STAGE_MIN_MS] 的段，例如 `separators=812 gutterBand=240`。
+     * 段名＝nightread 的除錯回呼名，時間＝上一個回呼到這一個（同 ProfileTest 的「本段」）。只在傳了 stats 時量。
+     */
+    var stagesMs: String? = null
+
+    companion object {
+        const val STAGE_MIN_MS = 30L
+    }
 }
 
 /**
@@ -186,7 +196,23 @@ object NightReadRenderer {
         val seg = maskFromBitmap(detection.textMask, w, h)
         val chars = Mask(w, h, charMask)
 
-        val res = NightRead.render(NightReadInput(gray, seg, regions, chars, chroma), params)
+        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；回呼只多做幾次遮罩計數（幾 ms），
+        // 輸出不變。沒傳 stats 就不掛回呼。
+        val marks = if (stats != null) StringBuilder() else null
+        var last = System.nanoTime()
+        val debug: NightReadDebug? = marks?.let { sb ->
+            { stage, _ ->
+                val now = System.nanoTime()
+                val d = (now - last) / 1_000_000
+                last = now
+                if (d >= NightReadStats.STAGE_MIN_MS) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(stage).append('=').append(d)
+                }
+            }
+        }
+        val res = NightRead.render(NightReadInput(gray, seg, regions, chars, chroma), params, debug)
+        stats?.stagesMs = marks?.toString()
 
         // 輸出：Gray 0..255 → 不透明灰 ARGB；重用 px 當輸出緩衝（省一份 w×h int）
         val out = res.out.data
