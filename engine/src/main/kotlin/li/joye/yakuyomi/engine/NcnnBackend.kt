@@ -1,5 +1,6 @@
 package li.joye.yakuyomi.engine
 
+import android.util.Log
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -78,9 +79,11 @@ class NcnnForwardAbortedException(message: String = "低優先權推論被呼叫
  * 由**第一個**進 `__kmpc_fork_call` 的執行緒建立（`pthread_once`；載模型的 create_pipeline 也會進），worker 的 nice、cgroup、
  * 執行緒名都從建立者繼承、之後永不調整。若第一個呼叫者是低優先權的執行緒，整個行程之後的推論（含翻譯）都跑在低優先權的
  * worker 上。所以 [createNet]／[createNetEx] 第一次被呼叫前，先在一條明確設成 nice 0 的專用執行緒（[NCNN_POOL_THREAD_NAME]）
- * 上跑一次 2 緒 ReLU 把池建起來、join 等它做完（[threadPoolReady]）。
+ * 上跑一次 2 緒 ReLU 把池建起來、join 等它做完（[ensureThreadPool]）。
  */
 internal object NcnnBackend {
+    private const val TAG = "NcnnBackend"
+
     /** 原生庫是否載得起來（缺 .so / 非 arm64 → false；三顆模型全 NCNN、沒有備援，呼叫端只能報錯）。 */
     val available: Boolean = try {
         System.loadLibrary("yakuyomi_ncnn")
@@ -102,28 +105,54 @@ internal object NcnnBackend {
 
     private external fun initThreadPoolNative(): Int
 
+    /** SimpleOMP 常駐池已由 nice 0 的專用執行緒建好（見 [ensureThreadPool]）；只在成功時設 true。 */
+    @Volatile
+    private var threadPoolReady = false
+    private val threadPoolLock = Any()
+
     /**
-     * SimpleOMP 常駐池是否已由 nice 0 的專用執行緒建好（見類別說明）。第一次讀＝建池：開 [NCNN_POOL_THREAD_NAME]、
-     * 先 `setThreadPriority(DEFAULT)`（Java 執行緒會繼承父執行緒的優先權）、JNI 跑一次 2 緒 ReLU（一定進 fork_call）、
-     * join。SYNCHRONIZED：第二個呼叫者會等池建好才返回。建池失敗只記 trace（之後照舊由第一個推論者建池）。
+     * 確保 SimpleOMP 常駐池由 nice 0 的專用執行緒建好（見類別說明）：開 [NCNN_POOL_THREAD_NAME]、先
+     * `setThreadPriority(DEFAULT)`（Java 執行緒會繼承父執行緒的優先權）、JNI 跑一次 2 緒 ReLU（一定進 fork_call）、join。
+     * 同一把鎖：第二個呼叫者會等池建好才返回。
+     *
+     * - **join 不可中斷**：呼叫端帶著中斷旗標（例如 `runInterruptible`、executor 被 cancel(true)）也照樣等建池做完、
+     *   事後補回中斷旗標，不讓載模型直接拋 InterruptedException。
+     * - **只記住成功**：建池失敗（rc≠0）記 WARN、下次 [createNet] 再試一次——否則池會改由第一個真正推論／載模型的執行緒
+     *   建立，那若是 nice 9 的夜讀 worker，整個行程之後的推論（含翻譯）都跑在低優先權的 worker 上。
+     *   池已建好時重試無害（`pthread_once`，只多跑一次 ReLU）。
      */
-    private val threadPoolReady: Boolean by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-        if (!available) return@lazy false
-        var rc = Int.MIN_VALUE
-        val t = Thread({
-            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT) }
-            rc = runCatching { initThreadPoolNative() }.getOrDefault(Int.MIN_VALUE)
-        }, NCNN_POOL_THREAD_NAME)
-        t.priority = Thread.NORM_PRIORITY
-        t.start()
-        t.join()
-        EngineTrace.log("ncnn.pool init rc=$rc")
-        rc == 0
+    private fun ensureThreadPool() {
+        if (threadPoolReady || !available) return
+        synchronized(threadPoolLock) {
+            if (threadPoolReady) return
+            var rc = Int.MIN_VALUE
+            val t = Thread({
+                runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT) }
+                rc = runCatching { initThreadPoolNative() }.getOrDefault(Int.MIN_VALUE)
+            }, NCNN_POOL_THREAD_NAME)
+            t.priority = Thread.NORM_PRIORITY
+            t.start()
+            var interrupted = false
+            while (t.isAlive) {
+                try {
+                    t.join()
+                } catch (e: InterruptedException) {
+                    interrupted = true
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt()
+            EngineTrace.log("ncnn.pool init rc=$rc")
+            if (rc == 0) {
+                threadPoolReady = true
+            } else {
+                Log.w(TAG, "SimpleOMP 常駐池建立失敗 rc=$rc（下次載模型再試）")
+            }
+        }
     }
 
     /** 載入 .param/.bin，回 native handle（純 CPU；NEON/Winograd、ncnn 預設緒數）；0=失敗。 */
     fun createNet(paramPath: String, binPath: String): Long {
-        threadPoolReady
+        ensureThreadPool()
         return createNetNative(paramPath, binPath)
     }
 
@@ -132,7 +161,7 @@ internal object NcnnBackend {
      * （storage=權重與中間值存 fp16、arith=用 fp16 指令算；transformer 若半精度算術讀錯字，可只留 storage）。
      */
     fun createNetEx(paramPath: String, binPath: String, numThreads: Int, fp16Storage: Boolean, fp16Arith: Boolean): Long {
-        threadPoolReady
+        ensureThreadPool()
         return createNetExNative(paramPath, binPath, numThreads, fp16Storage, fp16Arith)
     }
 
