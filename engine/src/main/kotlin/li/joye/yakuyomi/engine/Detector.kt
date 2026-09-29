@@ -46,7 +46,7 @@ class Detector(
         val db = FloatArray(2 * area)
         // ★ mask 尺寸半/全解析平台不定（x86 半解析 inW/2×inH/2、arm64 實測全解析 inW×inH）→ 緩衝配全解析上限、實際尺寸由 rc 回。
         val mask = FloatArray(area)
-        val rc = NcnnBackend.detectDbnet(ncnnHandle, pre.chw, inW, inH, db, mask, flavor.serialize, flavor.lowPriority)
+        val rc = NcnnBackend.detectDbnet(ncnnHandle, pre.chw, inW, inH, db, mask, flavor)
         check(rc > 0) {
             if (rc < 0) {
                 "DBNet 尺寸越界：實際 db.w=${(-rc) / 1000} mask.w=${(-rc) % 1000}（緩衝 db=2×${inW}×$inH、mask≤${inW}×$inH）"

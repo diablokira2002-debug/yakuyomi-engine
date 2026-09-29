@@ -16,7 +16,7 @@ import kotlin.math.sqrt
 /**
  * 多顆人物分割器的聯集（yolo ∪ cseg 定案配方：只用 yolo 守護框違規 18→27，加上 cseg 更準；見 nightread README）。
  * segment 逐顆跑、結果就地 OR 進第一顆的陣列（省一份 w×h）；close 關全部。
- * 不另開緒：多緒 Net 在 NCNN 全域鎖下本來就串行；1 緒不進鎖的組（夜讀讓路時）由呼叫端的多頁並行吃核。
+ * 不另開緒：多緒 Net 在 NCNN 全域鎖下本來就串行；1 緒不進鎖的組只在夜讀讓路時用（一次一頁、刻意不吃核）。
  */
 class UnionCharSegmenter(private val parts: List<CharSegmenter>) : CharSegmenter {
 
@@ -81,8 +81,8 @@ class NightReadStats {
  * 20 s 以上，所以 [render] 一條龍版把超過 [MAX_PIXELS] 的頁先等比縮到預算內再跑（偵測／分割／重繪都在縮圖上），
  * **輸出＝縮後尺寸**（夜讀是離線預算不是即時：真機一頁 6–25 s）。
  * **併發**：可以多頁並行——這裡與 nightread 函式庫都沒有共享可變狀態（函式庫已驗可重入：多緒 render 與單緒逐像素相同）。
- * 記憶體由呼叫端控管（每頁約 150 MB，512 MB heap 約只放得下 2 頁）；推論進不進 NCNN 全域鎖由模型組決定（[NcnnFlavor]），
- * 需要讓路或加優先權控制時用 lambda 版 [render]（呼叫端包自己的推論區段）。
+ * 記憶體由呼叫端控管（每頁約 150 MB，512 MB heap 約只放得下 2 頁）；推論進不進 NCNN 全域鎖、持鎖前向的優先權與中止由
+ * 模型組決定（[NcnnFlavor]、[NcnnLowPriorityHook]）；呼叫端要在每次推論前後插自己的檢查點時用 lambda 版 [render]。
  */
 object NightReadRenderer {
 
@@ -136,8 +136,9 @@ object NightReadRenderer {
     )
 
     /**
-     * lambda 版一條龍（上面那版委派到這裡）：推論由呼叫端的 [detect]／[segment] 做，好讓呼叫端包自己的推論區段
-     * （例如 fork 夜讀的優先權 ceiling、換組）；縮圖、併 [extraLines]、回收 textMask 與縮圖的邏輯都留在這裡。
+     * lambda 版一條龍（上面那版委派到這裡）：推論由呼叫端的 [detect]／[segment] 做，好讓呼叫端在每次推論前插自己的
+     * 檢查點（例如 fork 夜讀的暫停／讓路）；縮圖、併 [extraLines]、回收 textMask 與縮圖的邏輯都留在這裡。
+     * [detect]／[segment] 拋出的例外（含 [NcnnForwardAbortedException]）照樣往外拋，textMask 與縮圖在 finally 回收。
      *
      * [beforeRender]：推論做完、進入 Kotlin 重繪（一頁最貴的一段，數秒）之前呼叫一次。回 false＝放棄這頁 → 回 null，
      * finally 照樣回收 textMask 與縮圖（呼叫端用來在暫停／讓路時丟回待做、把 heap 放掉）。

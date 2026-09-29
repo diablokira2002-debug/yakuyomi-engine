@@ -70,7 +70,7 @@ class CsegSegmenter(
         val outs = CsegPost.allocOutputs()
         val rc = NcnnBackend.extract(
             handle, pre.chw, CsegPost.SIZE, CsegPost.SIZE, 3, CsegPost.OUT_NAMES, outs,
-            flavor.serialize, flavor.lowPriority,
+            flavor,
         )
         check(rc == 0) { "NCNN 人物分割推論失敗 rc=$rc" }
         return CsegPost.unionMask(outs, pre.nw, pre.nh, w, h)
@@ -382,7 +382,7 @@ class YoloSegSegmenter(
         val outs = YoloSegPost.allocOutputs()
         val rc = NcnnBackend.extract(
             handle, pre.chw, YoloSegPost.SIZE, YoloSegPost.SIZE, 3, YoloSegPost.OUT_NAMES, outs,
-            flavor.serialize, flavor.lowPriority,
+            flavor,
         )
         check(rc == 0) { "NCNN yoloseg 推論失敗 rc=$rc" }
         return YoloSegPost.unionMask(outs[0], outs[1], pre, w, h)

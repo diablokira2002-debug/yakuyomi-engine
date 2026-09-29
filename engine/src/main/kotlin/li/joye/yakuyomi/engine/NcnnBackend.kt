@@ -1,5 +1,6 @@
 package li.joye.yakuyomi.engine
 
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -19,14 +20,17 @@ const val NCNN_POOL_THREAD_NAME = "yaku-ncnn-pool"
  * @property serialize true＝推論進全域鎖（見 [NcnnBackend] 的 ncnnLock）；false 只允許 [numThreads] == 1——SimpleOMP 對
  *   1 緒的 parallel region 走 inline、不碰共用 task queue（同 OCR 並發模式，見 [NcnnBackend.ocrCtc]）。
  * @property lowPriority true＝夜讀：進鎖前若有翻譯在等鎖或持鎖就先讓（翻譯優先閘，見 [NcnnBackend]）；只在 [serialize] 時有意義。
+ * @property hook 低優先權推論的呼叫端掛鉤（中止、持鎖前向的優先權調整，見 [NcnnLowPriorityHook]）；只能配 [lowPriority]。
  */
 data class NcnnFlavor(
     val numThreads: Int = 0,
     val serialize: Boolean = true,
     val lowPriority: Boolean = false,
+    val hook: NcnnLowPriorityHook? = null,
 ) {
     init {
         require(serialize || numThreads == 1) { "不進鎖的 Net 只能 1 緒（numThreads=$numThreads）" }
+        require(hook == null || lowPriority) { "hook 只給低優先權（夜讀）的 Net" }
     }
 
     companion object {
@@ -40,6 +44,27 @@ data class NcnnFlavor(
         val NIGHT_FREE = NcnnFlavor(numThreads = 1, serialize = false, lowPriority = true)
     }
 }
+
+/**
+ * 低優先權（夜讀）推論的呼叫端掛鉤，一律在**發起推論的那條執行緒**上被呼叫（同一組 Net 可能被多頁共用，
+ * 實作要靠執行緒區域狀態分辨是哪一頁）。翻譯的 Net 不帶掛鉤，行為不變。
+ */
+interface NcnnLowPriorityHook {
+    /**
+     * 要不要放棄這次推論：每次前向開始前問一次；上鎖路徑在等翻譯讓出鎖期間約每 [NcnnBackend.LOW_PRIORITY_POLL_MS]
+     * 再問、拿到鎖後正式開跑前再問一次。true → 不進原生、拋 [NcnnForwardAbortedException]（呼叫端丟回待做）。
+     */
+    fun shouldAbort(): Boolean
+
+    /**
+     * 包住**持有全域鎖**的原生前向本身（不含等鎖、不含 Kotlin 前後處理），例如低優先權執行緒暫時拉回一般優先權，
+     * 免得它拿著鎖慢慢算、翻譯在鎖外乾等。必須恰好呼叫 [block] 一次並回傳它的結果。
+     */
+    fun <T> aroundLockedForward(block: () -> T): T
+}
+
+/** [NcnnLowPriorityHook.shouldAbort] 要求放棄：這次推論沒有進原生、沒有任何輸出。 */
+class NcnnForwardAbortedException(message: String = "低優先權推論被呼叫端放棄") : RuntimeException(message)
 
 /**
  * NCNN 推論後端（去字 + 偵測 + 人物分割 + OCR）。
@@ -138,7 +163,9 @@ internal object NcnnBackend {
      *
      * **翻譯優先閘**：夜讀的上鎖呼叫（lowPriority）不能擋翻譯。翻譯端從開始等鎖到放鎖期間 [hiWaiters] > 0；夜讀進鎖前先等它
      * 歸零、拿到鎖後再看一次（翻譯剛好又來就放掉重等）→ 翻譯最多只等夜讀當下正在跑的那一個前向。Java 監視器沒有優先權繼承，
-     * 單靠降夜讀執行緒的 nice 會把翻譯卡在低優先權持鎖者後面（優先權倒置）。
+     * 單靠降夜讀執行緒的 nice 會把翻譯卡在低優先權持鎖者後面（優先權倒置）——所以持鎖的那段另外交給
+     * [NcnnLowPriorityHook.aroundLockedForward]（夜讀在那裡暫時拉回一般優先權）。夜讀帶掛鉤時，等翻譯期間每
+     * [LOW_PRIORITY_POLL_MS] 問一次 [NcnnLowPriorityHook.shouldAbort]，暫停／讓路時不必等到翻譯空檔。
      */
     private val ncnnLock = Any()
 
@@ -148,8 +175,15 @@ internal object NcnnBackend {
     private val gateLock = ReentrantLock()
     private val noHiWaiters = gateLock.newCondition()
 
-    /** 依 [serialize]／[lowPriority] 跑一次原生推論（見 [ncnnLock] 的翻譯優先閘）。 */
-    private inline fun <T> forward(serialize: Boolean, lowPriority: Boolean, block: () -> T): T {
+    /** 夜讀帶掛鉤時，等翻譯讓出鎖期間多久問一次 [NcnnLowPriorityHook.shouldAbort]。 */
+    const val LOW_PRIORITY_POLL_MS = 50L
+
+    private fun <T> forward(flavor: NcnnFlavor, block: () -> T): T =
+        forward(flavor.serialize, flavor.lowPriority, flavor.hook, block)
+
+    /** 依 [serialize]／[lowPriority] 跑一次原生推論（見 [ncnnLock] 的翻譯優先閘）；[hook] 見 [NcnnLowPriorityHook]。 */
+    private fun <T> forward(serialize: Boolean, lowPriority: Boolean, hook: NcnnLowPriorityHook?, block: () -> T): T {
+        if (hook != null && hook.shouldAbort()) throw NcnnForwardAbortedException()
         if (!serialize) return block()
         if (!lowPriority) {
             gateLock.withLock { hiWaiters++ }
@@ -163,10 +197,34 @@ internal object NcnnBackend {
             }
         }
         while (true) {
-            gateLock.withLock { while (hiWaiters > 0) noHiWaiters.awaitUninterruptibly() }
+            // 翻譯在等鎖或持鎖 → 先讓。帶掛鉤就限時等、回來問要不要放棄（掛鉤是呼叫端的程式，不在 gateLock 內呼叫）
+            val clear = gateLock.withLock {
+                if (hiWaiters > 0) {
+                    if (hook == null) {
+                        noHiWaiters.awaitUninterruptibly()
+                    } else {
+                        try {
+                            noHiWaiters.await(LOW_PRIORITY_POLL_MS, TimeUnit.MILLISECONDS)
+                        } catch (e: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            throw NcnnForwardAbortedException("等翻譯讓出鎖時被中斷")
+                        }
+                    }
+                }
+                hiWaiters == 0
+            }
+            if (!clear) {
+                if (hook != null && hook.shouldAbort()) throw NcnnForwardAbortedException()
+                continue
+            }
             synchronized(ncnnLock) {
                 // 拿到鎖時翻譯又來了 → 放掉、讓它先
-                if (hiWaiters == 0) return block()
+                if (hiWaiters == 0) {
+                    if (hook == null) return block()
+                    // 等 ncnnLock 期間（別頁的夜讀前向）可能已經要放棄了；鎖序＝ncnnLock → 呼叫端的鎖（掛鉤不會回頭拿 ncnnLock）
+                    if (hook.shouldAbort()) throw NcnnForwardAbortedException()
+                    return hook.aroundLockedForward(block)
+                }
             }
         }
     }
@@ -181,7 +239,7 @@ internal object NcnnBackend {
 
     /**
      * DBNet 偵測（矩形 resize_aspect 輸入，繞開正方形 832-992 crash 帶）：chw=[3,inH,inW] → db 填 [2*inW*inH]（raw logits 2ch 全解析）、
-     * mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。[serialize]／[lowPriority] 見 [NcnnFlavor]。
+     * mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。[flavor]＝進不進鎖、優先權與掛鉤（見 [NcnnFlavor]）。
      */
     fun detectDbnet(
         handle: Long,
@@ -190,11 +248,10 @@ internal object NcnnBackend {
         inH: Int,
         db: FloatArray,
         mask: FloatArray,
-        serialize: Boolean = true,
-        lowPriority: Boolean = false,
+        flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
     ): Int {
         EngineTrace.log("ncnn.detectDbnet.enter ${inW}x$inH")
-        return forward(serialize, lowPriority) {
+        return forward(flavor) {
             EngineTrace.log("ncnn.detectDbnet.call ${inW}x$inH")
             val rc = detectDbnetNative(handle, chw, inW, inH, db, mask)
             EngineTrace.log("ncnn.detectDbnet.exit rc=$rc")
@@ -205,7 +262,7 @@ internal object NcnnBackend {
     /** 去字 AOT：img=NCHW[3,s,s]（[-1,1] holes-zeroed）+ mask=[s*s] → out 填 [3*s*s]（[-1,1]）。回 0=OK。序列化（見 [ncnnLock]）。 */
     fun inpaintAot(handle: Long, img: FloatArray, mask: FloatArray, s: Int, out: FloatArray): Int {
         EngineTrace.log("ncnn.inpaint.enter s=$s")
-        return forward(serialize = true, lowPriority = false) {
+        return forward(NcnnFlavor.DEFAULT) {
             EngineTrace.log("ncnn.inpaint.call s=$s")
             val rc = inpaintAotNative(handle, img, mask, s, out)
             EngineTrace.log("ncnn.inpaint.exit rc=$rc")
@@ -216,7 +273,7 @@ internal object NcnnBackend {
     /**
      * 通用抽取（後處理在 Kotlin 的模型，如人物分割）：chw=[inC,inH,inW] 進 in0，依 [outNames] 抽出各 blob、
      * 逐 channel 複製進 [outs]（每個陣列大小要等於該 blob 的 w×h×c）。回 0=OK、-2 大小不合、-3 抽取失敗。
-     * [serialize]／[lowPriority] 見 [NcnnFlavor]。
+     * [flavor]＝進不進鎖、優先權與掛鉤（見 [NcnnFlavor]）。
      */
     fun extract(
         handle: Long,
@@ -226,11 +283,10 @@ internal object NcnnBackend {
         inC: Int,
         outNames: Array<String>,
         outs: Array<FloatArray>,
-        serialize: Boolean = true,
-        lowPriority: Boolean = false,
+        flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
     ): Int {
         EngineTrace.log("ncnn.extract.enter ${inW}x$inH x$inC → ${outNames.size} blobs")
-        return forward(serialize, lowPriority) {
+        return forward(flavor) {
             val rc = extractNative(handle, chw, inW, inH, inC, outNames, outs)
             EngineTrace.log("ncnn.extract.exit rc=$rc")
             rc
@@ -247,5 +303,5 @@ internal object NcnnBackend {
      * 「8 行並發快 46%」的前提。非並發模式（num_threads>1）照舊序列化。
      */
     fun ocrCtc(handle: Long, chw: FloatArray, w: Int, h: Int, pe: FloatArray, t: Int, idx: IntArray, logp: FloatArray, serialize: Boolean): Int =
-        forward(serialize, lowPriority = false) { ocrCtcNative(handle, chw, w, h, pe, t, idx, logp) }
+        forward(serialize, lowPriority = false, hook = null) { ocrCtcNative(handle, chw, w, h, pe, t, idx, logp) }
 }
