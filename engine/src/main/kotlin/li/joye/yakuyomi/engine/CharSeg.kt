@@ -11,7 +11,7 @@ import kotlin.math.roundToInt
 /**
  * 人物語意分割（夜讀用）：把一頁的人物像素標出來，夜讀重繪據此「絕不塗錯」臉／手／白衣／白髮。
  *
- * 模型走 NCNN（與偵測、去字同一個後端、同一把鎖）。回傳與頁面同尺寸（row-major w×h）的布林遮罩，true＝人物。
+ * 模型走 NCNN（與偵測、去字同一個後端；進不進全域鎖看 [NcnnFlavor]）。回傳與頁面同尺寸（row-major w×h）的布林遮罩，true＝人物。
  * 這是**模型原輸出**的聯集，貼墨收邊與平滑由夜讀管線負責。
  * 定案配方＝yolo ∪ cseg（[UnionCharSegmenter]，由 [NightReadRenderer.charSegmenter] 組）。
  */
@@ -45,13 +45,18 @@ interface CharSegmenter : AutoCloseable {
  * → **再散布授權不明確**（不是 MIT、也不是 GPL）。本專案照散布（models.json role "charseg"）並附 attribution，
  * 聲明研究／非商業用途、權利人要求即下架、使用者亦可自行取得權重（BYOM 放 `models/`）。
  */
-class CsegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
+class CsegSegmenter(
+    paramPath: String,
+    binPath: String,
+    /** Net 的建法與推論路徑（見 [NcnnFlavor]）。 */
+    private val flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
+) : CharSegmenter {
 
     private var handle: Long = 0L
 
     init {
         check(NcnnBackend.available) { "NCNN 原生庫未載入，無法做人物分割" }
-        handle = NcnnBackend.createNet(paramPath, binPath)
+        handle = NcnnBackend.createNet(paramPath, binPath, flavor)
         check(handle != 0L) { "NCNN 人物分割模型載入失敗：$paramPath" }
     }
 
@@ -63,7 +68,10 @@ class CsegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
         page.getPixels(px, 0, w, 0, 0, w, h)
         val pre = CsegPost.preprocess(px, w, h)
         val outs = CsegPost.allocOutputs()
-        val rc = NcnnBackend.extract(handle, pre.chw, CsegPost.SIZE, CsegPost.SIZE, 3, CsegPost.OUT_NAMES, outs)
+        val rc = NcnnBackend.extract(
+            handle, pre.chw, CsegPost.SIZE, CsegPost.SIZE, 3, CsegPost.OUT_NAMES, outs,
+            flavor.serialize, flavor.lowPriority,
+        )
         check(rc == 0) { "NCNN 人物分割推論失敗 rc=$rc" }
         return CsegPost.unionMask(outs, pre.nw, pre.nh, w, h)
     }
@@ -349,13 +357,18 @@ object CsegPost {
  * 本專案照散布（models.json role "charseg"）並附上述 attribution，聲明研究／非商業用途、權利人要求即下架、
  * 使用者亦可自行取得權重（BYOM 放 `models/`）。
  */
-class YoloSegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
+class YoloSegSegmenter(
+    paramPath: String,
+    binPath: String,
+    /** Net 的建法與推論路徑（見 [NcnnFlavor]）。 */
+    private val flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
+) : CharSegmenter {
 
     private var handle: Long = 0L
 
     init {
         check(NcnnBackend.available) { "NCNN 原生庫未載入，無法做人物分割" }
-        handle = NcnnBackend.createNet(paramPath, binPath)
+        handle = NcnnBackend.createNet(paramPath, binPath, flavor)
         check(handle != 0L) { "NCNN yoloseg 模型載入失敗：$paramPath" }
     }
 
@@ -367,7 +380,10 @@ class YoloSegSegmenter(paramPath: String, binPath: String) : CharSegmenter {
         page.getPixels(px, 0, w, 0, 0, w, h)
         val pre = YoloSegPost.preprocess(px, w, h)
         val outs = YoloSegPost.allocOutputs()
-        val rc = NcnnBackend.extract(handle, pre.chw, YoloSegPost.SIZE, YoloSegPost.SIZE, 3, YoloSegPost.OUT_NAMES, outs)
+        val rc = NcnnBackend.extract(
+            handle, pre.chw, YoloSegPost.SIZE, YoloSegPost.SIZE, 3, YoloSegPost.OUT_NAMES, outs,
+            flavor.serialize, flavor.lowPriority,
+        )
         check(rc == 0) { "NCNN yoloseg 推論失敗 rc=$rc" }
         return YoloSegPost.unionMask(outs[0], outs[1], pre, w, h)
     }

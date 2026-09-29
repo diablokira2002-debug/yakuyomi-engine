@@ -6,6 +6,8 @@
 #include <cstring>
 #include "net.h"
 #include "cpu.h"
+#include "layer.h"
+#include "layer_type.h"
 
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "yakuyomi_ncnn", __VA_ARGS__)
 
@@ -28,7 +30,7 @@ static jlong loadNet(JNIEnv* env, ncnn::Net* net, jstring paramPath, jstring bin
 // 載入 pnnx 轉出的 .param/.bin，回 native handle（ncnn::Net*，純 CPU、ncnn 預設選項）；0=失敗。
 // （GPU/Vulkan 已移除：NCNN Vulkan 實測算不對 AOT-GAN，見 memory ncnn-vulkan-fp16。）
 extern "C" JNIEXPORT jlong JNICALL
-Java_li_joye_yakuyomi_engine_NcnnBackend_createNet(
+Java_li_joye_yakuyomi_engine_NcnnBackend_createNetNative(
         JNIEnv* env, jobject, jstring paramPath, jstring binPath) {
     return loadNet(env, new ncnn::Net(), paramPath, binPath);
 }
@@ -37,7 +39,7 @@ Java_li_joye_yakuyomi_engine_NcnnBackend_createNet(
 // 不碰共用 task queue，多條 strip 才能同時 forward 而不必進 Kotlin 端的 ncnnLock）；fp16Storage／fp16Arith 分開關：
 // storage 關＝權重載入時轉 fp32、中間值 fp32；arith 關＝不用 fp16 指令算（ncnn 的 fp16s 路徑：存半精度、算單精度）。
 extern "C" JNIEXPORT jlong JNICALL
-Java_li_joye_yakuyomi_engine_NcnnBackend_createNetEx(
+Java_li_joye_yakuyomi_engine_NcnnBackend_createNetExNative(
         JNIEnv* env, jobject, jstring paramPath, jstring binPath, jint numThreads, jboolean fp16Storage, jboolean fp16Arith) {
     ncnn::Net* net = new ncnn::Net();
     if (numThreads > 0) net->opt.num_threads = numThreads;
@@ -48,6 +50,28 @@ Java_li_joye_yakuyomi_engine_NcnnBackend_createNetEx(
     }
     if (!fp16Arith) net->opt.use_fp16_arithmetic = false;
     return loadNet(env, net, paramPath, binPath);
+}
+
+// 建 SimpleOMP 常駐 worker 池：對一個 2 緒 ReLU 做一次 forward_inplace（arm 的 ReLU 迴圈帶 `omp parallel for
+// num_threads(opt.num_threads)` → 一定進 __kmpc_fork_call → pthread_once 建池）。worker 繼承呼叫端執行緒的 nice／cgroup／名字，
+// 所以 Kotlin 端只在一條剛設成 nice 0 的專用執行緒上呼叫（見 NcnnBackend.threadPoolReady）。回 0=OK。
+extern "C" JNIEXPORT jint JNICALL
+Java_li_joye_yakuyomi_engine_NcnnBackend_initThreadPoolNative(JNIEnv*, jobject) {
+    ncnn::Layer* relu = ncnn::create_layer_cpu(ncnn::LayerType::ReLU);
+    if (!relu) return -1;
+    ncnn::Option opt;
+    opt.num_threads = 2;
+    ncnn::ParamDict pd;
+    relu->load_param(pd);
+    int rc = relu->create_pipeline(opt);
+    if (rc == 0) {
+        ncnn::Mat m(8, 8, 4);   // fp32、4 channel：走一般 fp32 路徑的 channel 迴圈
+        m.fill(-1.f);
+        rc = relu->forward_inplace(m, opt);
+        relu->destroy_pipeline(opt);
+    }
+    delete relu;
+    return rc;
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -16,7 +16,7 @@ import kotlin.math.sqrt
 /**
  * 多顆人物分割器的聯集（yolo ∪ cseg 定案配方：只用 yolo 守護框違規 18→27，加上 cseg 更準；見 nightread README）。
  * segment 逐顆跑、結果就地 OR 進第一顆的陣列（省一份 w×h）；close 關全部。
- * 各顆推論都在 NCNN 全域鎖下，逐顆串行本來就是實際行為，不另開緒。
+ * 不另開緒：多緒 Net 在 NCNN 全域鎖下本來就串行；1 緒不進鎖的組（夜讀讓路時）由呼叫端的多頁並行吃核。
  */
 class UnionCharSegmenter(private val parts: List<CharSegmenter>) : CharSegmenter {
 
@@ -77,10 +77,12 @@ class NightReadStats {
  *  4. `charMask`＝分割模型**原輸出**（不收邊、不平滑；貼墨收邊與偽泡判定由管線自己做）。
  *  5. `regions`＝[Grouping.group] 後每個 [TextRegion] 的軸對齊 bbox（Float → Int、夾進頁面）。
  *
- * **資源**：每像素約 40 B 工作記憶體（gray/chroma/seg/char 各 4–8 B + 管線中間遮罩），7 MPx 頁要 20 s 以上，
- * 所以 [render] 一條龍版把超過 [MAX_PIXELS] 的頁先等比縮到預算內再跑（偵測／分割／重繪都在縮圖上），
+ * **資源**：每頁在飛約 58 B/px 的 Java heap（重繪內部尖峰約 43 B/px ＋ 包裝層的 px/gray/chroma/seg/char），7 MPx 頁要
+ * 20 s 以上，所以 [render] 一條龍版把超過 [MAX_PIXELS] 的頁先等比縮到預算內再跑（偵測／分割／重繪都在縮圖上），
  * **輸出＝縮後尺寸**（夜讀是離線預算不是即時：真機一頁 6–25 s）。
- * **併發**：一次只跑一頁——由呼叫端保證，這裡不加鎖（NCNN 推論本就在全域鎖下串行；重繪的中間陣列兩頁同時撐會 OOM）。
+ * **併發**：可以多頁並行——這裡與 nightread 函式庫都沒有共享可變狀態（函式庫已驗可重入：多緒 render 與單緒逐像素相同）。
+ * 記憶體由呼叫端控管（每頁約 150 MB，512 MB heap 約只放得下 2 頁）；推論進不進 NCNN 全域鎖由模型組決定（[NcnnFlavor]），
+ * 需要讓路或加優先權控制時用 lambda 版 [render]（呼叫端包自己的推論區段）。
  */
 object NightReadRenderer {
 
@@ -90,13 +92,17 @@ object NightReadRenderer {
     /**
      * 由 `.param` 路徑建人物分割器（`.bin`＝同名換副檔名，與 [Detector] 慣例同）。
      * 兩個都 null → null（夜讀模型沒下／BYOM 沒放，呼叫端關掉夜讀）；只有一個 → 單顆；否則 yolo ∪ cseg 聯集。
-     * 建到一半失敗會把已開的那顆關掉再拋（native handle 不漏）。
+     * [flavor]＝兩顆共用的建法與推論路徑（見 [NcnnFlavor]）。建到一半失敗會把已開的那顆關掉再拋（native handle 不漏）。
      */
-    fun charSegmenter(yoloParam: String?, csegParam: String?): CharSegmenter? {
+    fun charSegmenter(
+        yoloParam: String?,
+        csegParam: String?,
+        flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
+    ): CharSegmenter? {
         val parts = ArrayList<CharSegmenter>(2)
         try {
-            yoloParam?.let { parts += YoloSegSegmenter(it, binOf(it)) }
-            csegParam?.let { parts += CsegSegmenter(it, binOf(it)) }
+            yoloParam?.let { parts += YoloSegSegmenter(it, binOf(it), flavor) }
+            csegParam?.let { parts += CsegSegmenter(it, binOf(it), flavor) }
         } catch (t: Throwable) {
             parts.forEach { runCatching { it.close() } }
             throw t
@@ -125,11 +131,30 @@ object NightReadRenderer {
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
-    ): Bitmap {
+    ): Bitmap = checkNotNull(
+        render(page, detect = detector::detect, segment = charSeg::segment, params = params, stats = stats, extraLines = extraLines),
+    )
+
+    /**
+     * lambda 版一條龍（上面那版委派到這裡）：推論由呼叫端的 [detect]／[segment] 做，好讓呼叫端包自己的推論區段
+     * （例如 fork 夜讀的優先權 ceiling、換組）；縮圖、併 [extraLines]、回收 textMask 與縮圖的邏輯都留在這裡。
+     *
+     * [beforeRender]：推論做完、進入 Kotlin 重繪（一頁最貴的一段，數秒）之前呼叫一次。回 false＝放棄這頁 → 回 null，
+     * finally 照樣回收 textMask 與縮圖（呼叫端用來在暫停／讓路時丟回待做、把 heap 放掉）。
+     */
+    fun render(
+        page: Bitmap,
+        detect: (Bitmap) -> Detection,
+        segment: (Bitmap) -> BooleanArray,
+        params: NightReadParams = NightReadParams(),
+        stats: NightReadStats? = null,
+        extraLines: List<TextLine> = emptyList(),
+        beforeRender: () -> Boolean = { true },
+    ): Bitmap? {
         val work = scaleToBudget(page, stats)
         try {
             var t = System.nanoTime()
-            val detected = detector.detect(work)
+            val detected = detect(work)
             stats?.detectMs = (System.nanoTime() - t) / 1_000_000
             val detection = if (extraLines.isEmpty()) {
                 detected
@@ -144,8 +169,9 @@ object NightReadRenderer {
             }
             try {
                 t = System.nanoTime()
-                val chars = charSeg.segment(work)
+                val chars = segment(work)
                 stats?.maskMs = (System.nanoTime() - t) / 1_000_000
+                if (!beforeRender()) return null
                 return render(work, detection, chars, params, stats)
             } finally {
                 detected.textMask.recycle()

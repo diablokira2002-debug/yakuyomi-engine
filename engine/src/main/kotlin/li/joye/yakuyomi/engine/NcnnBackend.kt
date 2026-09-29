@@ -1,5 +1,46 @@
 package li.joye.yakuyomi.engine
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * SimpleOMP 常駐 worker 的執行緒名（＝建池那條專用執行緒的名字，worker 由它 pthread_create、繼承 comm）。
+ * 診斷用：fork 的夜讀效能探針掃 `/proc/self/task/<tid>/comm` 找這個名字，彙總 worker 的 nice（見 [NcnnBackend] 的建池說明）。
+ */
+const val NCNN_POOL_THREAD_NAME = "yaku-ncnn-pool"
+
+/**
+ * 一組 NCNN Net 的建法與推論路徑。翻譯全用 [DEFAULT]；夜讀依當下是否要讓路，在 [NIGHT_LOCKED]／[NIGHT_FREE] 之間換組。
+ *
+ * **緒數只能在載模型時定**：卷積的 winograd／gemm 路徑用載入時的緒數（ncnn `convolution_arm.cpp`），載入後改
+ * `opt.num_threads` 不生效 → 要換緒數就得換一組 Net。
+ *
+ * @property numThreads > 0＝以此緒數建（createNetEx）；0＝ncnn 預設（`get_physical_big_cpu_count()`，大核數）。
+ * @property serialize true＝推論進全域鎖（見 [NcnnBackend] 的 ncnnLock）；false 只允許 [numThreads] == 1——SimpleOMP 對
+ *   1 緒的 parallel region 走 inline、不碰共用 task queue（同 OCR 並發模式，見 [NcnnBackend.ocrCtc]）。
+ * @property lowPriority true＝夜讀：進鎖前若有翻譯在等鎖或持鎖就先讓（翻譯優先閘，見 [NcnnBackend]）；只在 [serialize] 時有意義。
+ */
+data class NcnnFlavor(
+    val numThreads: Int = 0,
+    val serialize: Boolean = true,
+    val lowPriority: Boolean = false,
+) {
+    init {
+        require(serialize || numThreads == 1) { "不進鎖的 Net 只能 1 緒（numThreads=$numThreads）" }
+    }
+
+    companion object {
+        /** 翻譯：ncnn 預設緒數、進鎖、一般優先。 */
+        val DEFAULT = NcnnFlavor()
+
+        /** 夜讀（沒有翻譯在跑）：ncnn 預設緒數、進鎖，但翻譯一來就讓它先。 */
+        val NIGHT_LOCKED = NcnnFlavor(lowPriority = true)
+
+        /** 夜讀（翻譯在跑、讓路）：1 緒、不進鎖——從不擋翻譯的偵測／去字。 */
+        val NIGHT_FREE = NcnnFlavor(numThreads = 1, serialize = false, lowPriority = true)
+    }
+}
+
 /**
  * NCNN 推論後端（去字 + 偵測 + 人物分割 + OCR）。
  *
@@ -7,6 +48,12 @@ package li.joye.yakuyomi.engine
  * 收工 `releaseNet`。模型換到手機 CPU 的 NEON/Winograd → 偵測實測比 ORT-XNNPACK 快 ~3.7×（見 memory litert-gpu-blocked）。
  * OCR 原本卡在「transformer 位置編碼被 trace 烤死在轉換寬度」的寬度牆，2026-09-21 改把 PE 當第二個輸入餵進去
  * （parity/export_ocr_ncnn.py）後也搬過來；[ocrCtc] 的並發規則見其註解。
+ *
+ * **SimpleOMP worker 以 nice 0 出生**：ncnn 的多緒 runtime 是 SimpleOMP（整個行程一個常駐池、`cpu_count−1` 條 worker），
+ * 由**第一個**進 `__kmpc_fork_call` 的執行緒建立（`pthread_once`；載模型的 create_pipeline 也會進），worker 的 nice、cgroup、
+ * 執行緒名都從建立者繼承、之後永不調整。若第一個呼叫者是低優先權的執行緒，整個行程之後的推論（含翻譯）都跑在低優先權的
+ * worker 上。所以 [createNet]／[createNetEx] 第一次被呼叫前，先在一條明確設成 nice 0 的專用執行緒（[NCNN_POOL_THREAD_NAME]）
+ * 上跑一次 2 緒 ReLU 把池建起來、join 等它做完（[threadPoolReady]）。
  */
 internal object NcnnBackend {
     /** 原生庫是否載得起來（缺 .so / 非 arm64 → false；三顆模型全 NCNN、沒有備援，呼叫端只能報錯）。 */
@@ -17,14 +64,60 @@ internal object NcnnBackend {
         false
     }
 
-    /** 載入 .param/.bin，回 native handle（純 CPU；NEON/Winograd）；0=失敗。★ 不改此 external 名（JNI 符號 = Java_..._createNet，改名會 UnsatisfiedLinkError）。 */
-    external fun createNet(paramPath: String, binPath: String): Long
+    // ★ external 名＝JNI 符號（Java_li_joye_yakuyomi_engine_NcnnBackend_<名>）；改名要連 ncnn_jni.cpp 一起改，否則 UnsatisfiedLinkError。
+    private external fun createNetNative(paramPath: String, binPath: String): Long
+
+    private external fun createNetExNative(
+        paramPath: String,
+        binPath: String,
+        numThreads: Int,
+        fp16Storage: Boolean,
+        fp16Arith: Boolean,
+    ): Long
+
+    private external fun initThreadPoolNative(): Int
+
+    /**
+     * SimpleOMP 常駐池是否已由 nice 0 的專用執行緒建好（見類別說明）。第一次讀＝建池：開 [NCNN_POOL_THREAD_NAME]、
+     * 先 `setThreadPriority(DEFAULT)`（Java 執行緒會繼承父執行緒的優先權）、JNI 跑一次 2 緒 ReLU（一定進 fork_call）、
+     * join。SYNCHRONIZED：第二個呼叫者會等池建好才返回。建池失敗只記 trace（之後照舊由第一個推論者建池）。
+     */
+    private val threadPoolReady: Boolean by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        if (!available) return@lazy false
+        var rc = Int.MIN_VALUE
+        val t = Thread({
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT) }
+            rc = runCatching { initThreadPoolNative() }.getOrDefault(Int.MIN_VALUE)
+        }, NCNN_POOL_THREAD_NAME)
+        t.priority = Thread.NORM_PRIORITY
+        t.start()
+        t.join()
+        EngineTrace.log("ncnn.pool init rc=$rc")
+        rc == 0
+    }
+
+    /** 載入 .param/.bin，回 native handle（純 CPU；NEON/Winograd、ncnn 預設緒數）；0=失敗。 */
+    fun createNet(paramPath: String, binPath: String): Long {
+        threadPoolReady
+        return createNetNative(paramPath, binPath)
+    }
 
     /**
      * [createNet] 加選項：numThreads（>0 才設；OCR 並發模式設 1）、fp16Storage／fp16Arith 分開控制半精度
      * （storage=權重與中間值存 fp16、arith=用 fp16 指令算；transformer 若半精度算術讀錯字，可只留 storage）。
      */
-    external fun createNetEx(paramPath: String, binPath: String, numThreads: Int, fp16Storage: Boolean, fp16Arith: Boolean): Long
+    fun createNetEx(paramPath: String, binPath: String, numThreads: Int, fp16Storage: Boolean, fp16Arith: Boolean): Long {
+        threadPoolReady
+        return createNetExNative(paramPath, binPath, numThreads, fp16Storage, fp16Arith)
+    }
+
+    /** 依 [flavor] 建 Net：指定緒數走 [createNetEx]（fp16 全開＝與 [createNet] 只差緒數），否則 [createNet]。 */
+    fun createNet(paramPath: String, binPath: String, flavor: NcnnFlavor): Long =
+        if (flavor.numThreads > 0) {
+            createNetEx(paramPath, binPath, flavor.numThreads, fp16Storage = true, fp16Arith = true)
+        } else {
+            createNet(paramPath, binPath)
+        }
 
     external fun releaseNet(handle: Long)
 
@@ -34,18 +127,49 @@ internal object NcnnBackend {
     val cpuSupportsFp16: Boolean by lazy { available && runCatching { cpuSupportsFp16Native() }.getOrDefault(false) }
 
     /**
-     * ★ 全域鎖：**序列化所有 ncnn 原生推論**（detect + 去字）。
+     * ★ 全域鎖：序列化多緒 Net 的原生推論（偵測 + 去字 + 人物分割）。
      *
-     * ncnn 內部用 **OpenMP**（libomp 靜態連進 libyakuyomi_ncnn.so）做卷積平行化。多個 app 執行緒**同時**進入
-     * ncnn forward（跨頁併發把 detect/去字 派到多個 Dispatchers.Default 緒）→ 各自開 OpenMP parallel region →
-     * OpenMP 全域 runtime 不容許多個並發 master → **`__kmp_abort_process` 直接 abort 行程（SIGABRT）**。
-     * 真機 tombstone 實證（thread=DefaultDispatch, #01 __kmp_abort_process），2026-07-14。
+     * 起因是 libomp 年代：多個 app 執行緒同時進 ncnn forward、各開 OpenMP parallel region → `__kmp_abort_process` 直接
+     * abort 行程（真機 tombstone，2026-07-14）。現在的 runtime 是 SimpleOMP（見 memory ncnn-simpleomp-crash-fix），
+     * 多緒 Net 仍保守持鎖：共用一個 task queue 的多個並發 master 沒驗過，且 CPU 本來也無法真的同時跑兩份多緒前向。
+     * **不進鎖的前提**＝Net 以 1 緒建（[NcnnFlavor.serialize]＝false）：SimpleOMP 對 num_threads==1 的 parallel region 走
+     * inline（`__kmpc_fork_call`：不碰共用 task queue、全域初始化用 pthread_once），可與持鎖中的多緒前向同時跑——OCR 並發模式
+     * （[ocrCtc]）與夜讀讓路時的模型組（[NcnnFlavor.NIGHT_FREE]）走這條。
      *
-     * detect 與 去字共用同一把鎖（同一個 ncnn OpenMP runtime，任兩個並發的 parallel region 都會撞）。
-     * OCR 走 [ocrCtc]（1 緒 Net、SimpleOMP inline，見該註解）不進此鎖，翻譯走網路 → 併發保留。detect/去字 皆 CPU-bound，
-     * 序列化幾乎不損吞吐（本就塞在翻譯的網路等待窗內、CPU 也無法真的同時跑兩份）。
+     * **翻譯優先閘**：夜讀的上鎖呼叫（lowPriority）不能擋翻譯。翻譯端從開始等鎖到放鎖期間 [hiWaiters] > 0；夜讀進鎖前先等它
+     * 歸零、拿到鎖後再看一次（翻譯剛好又來就放掉重等）→ 翻譯最多只等夜讀當下正在跑的那一個前向。Java 監視器沒有優先權繼承，
+     * 單靠降夜讀執行緒的 nice 會把翻譯卡在低優先權持鎖者後面（優先權倒置）。
      */
     private val ncnnLock = Any()
+
+    /** 翻譯端（非 lowPriority）正在等 [ncnnLock] 或持有它的呼叫數。在 [gateLock] 下改、在 [ncnnLock] 內無鎖讀。 */
+    @Volatile
+    private var hiWaiters = 0
+    private val gateLock = ReentrantLock()
+    private val noHiWaiters = gateLock.newCondition()
+
+    /** 依 [serialize]／[lowPriority] 跑一次原生推論（見 [ncnnLock] 的翻譯優先閘）。 */
+    private inline fun <T> forward(serialize: Boolean, lowPriority: Boolean, block: () -> T): T {
+        if (!serialize) return block()
+        if (!lowPriority) {
+            gateLock.withLock { hiWaiters++ }
+            try {
+                return synchronized(ncnnLock) { block() }
+            } finally {
+                gateLock.withLock {
+                    hiWaiters--
+                    if (hiWaiters == 0) noHiWaiters.signalAll()
+                }
+            }
+        }
+        while (true) {
+            gateLock.withLock { while (hiWaiters > 0) noHiWaiters.awaitUninterruptibly() }
+            synchronized(ncnnLock) {
+                // 拿到鎖時翻譯又來了 → 放掉、讓它先
+                if (hiWaiters == 0) return block()
+            }
+        }
+    }
 
     private external fun detectDbnetNative(handle: Long, chw: FloatArray, inW: Int, inH: Int, db: FloatArray, mask: FloatArray): Int
 
@@ -55,10 +179,22 @@ internal object NcnnBackend {
 
     private external fun ocrCtcNative(handle: Long, chw: FloatArray, w: Int, h: Int, pe: FloatArray, t: Int, idx: IntArray, logp: FloatArray): Int
 
-    /** DBNet 偵測（矩形 resize_aspect 輸入，繞開正方形 832-992 crash 帶）：chw=[3,inH,inW] → db 填 [2*inW*inH]（raw logits 2ch 全解析）、mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。序列化（見 [ncnnLock]）。 */
-    fun detectDbnet(handle: Long, chw: FloatArray, inW: Int, inH: Int, db: FloatArray, mask: FloatArray): Int {
+    /**
+     * DBNet 偵測（矩形 resize_aspect 輸入，繞開正方形 832-992 crash 帶）：chw=[3,inH,inW] → db 填 [2*inW*inH]（raw logits 2ch 全解析）、
+     * mask 填 [(inW/2)*(inH/2)]（已 sigmoid 半解析）。回 mask.h（>0=OK）。[serialize]／[lowPriority] 見 [NcnnFlavor]。
+     */
+    fun detectDbnet(
+        handle: Long,
+        chw: FloatArray,
+        inW: Int,
+        inH: Int,
+        db: FloatArray,
+        mask: FloatArray,
+        serialize: Boolean = true,
+        lowPriority: Boolean = false,
+    ): Int {
         EngineTrace.log("ncnn.detectDbnet.enter ${inW}x$inH")
-        return synchronized(ncnnLock) {
+        return forward(serialize, lowPriority) {
             EngineTrace.log("ncnn.detectDbnet.call ${inW}x$inH")
             val rc = detectDbnetNative(handle, chw, inW, inH, db, mask)
             EngineTrace.log("ncnn.detectDbnet.exit rc=$rc")
@@ -69,7 +205,7 @@ internal object NcnnBackend {
     /** 去字 AOT：img=NCHW[3,s,s]（[-1,1] holes-zeroed）+ mask=[s*s] → out 填 [3*s*s]（[-1,1]）。回 0=OK。序列化（見 [ncnnLock]）。 */
     fun inpaintAot(handle: Long, img: FloatArray, mask: FloatArray, s: Int, out: FloatArray): Int {
         EngineTrace.log("ncnn.inpaint.enter s=$s")
-        return synchronized(ncnnLock) {
+        return forward(serialize = true, lowPriority = false) {
             EngineTrace.log("ncnn.inpaint.call s=$s")
             val rc = inpaintAotNative(handle, img, mask, s, out)
             EngineTrace.log("ncnn.inpaint.exit rc=$rc")
@@ -79,11 +215,22 @@ internal object NcnnBackend {
 
     /**
      * 通用抽取（後處理在 Kotlin 的模型，如人物分割）：chw=[inC,inH,inW] 進 in0，依 [outNames] 抽出各 blob、
-     * 逐 channel 複製進 [outs]（每個陣列大小要等於該 blob 的 w×h×c）。回 0=OK、-2 大小不合、-3 抽取失敗。序列化（見 [ncnnLock]）。
+     * 逐 channel 複製進 [outs]（每個陣列大小要等於該 blob 的 w×h×c）。回 0=OK、-2 大小不合、-3 抽取失敗。
+     * [serialize]／[lowPriority] 見 [NcnnFlavor]。
      */
-    fun extract(handle: Long, chw: FloatArray, inW: Int, inH: Int, inC: Int, outNames: Array<String>, outs: Array<FloatArray>): Int {
+    fun extract(
+        handle: Long,
+        chw: FloatArray,
+        inW: Int,
+        inH: Int,
+        inC: Int,
+        outNames: Array<String>,
+        outs: Array<FloatArray>,
+        serialize: Boolean = true,
+        lowPriority: Boolean = false,
+    ): Int {
         EngineTrace.log("ncnn.extract.enter ${inW}x$inH x$inC → ${outNames.size} blobs")
-        return synchronized(ncnnLock) {
+        return forward(serialize, lowPriority) {
             val rc = extractNative(handle, chw, inW, inH, inC, outNames, outs)
             EngineTrace.log("ncnn.extract.exit rc=$rc")
             rc
@@ -97,14 +244,8 @@ internal object NcnnBackend {
      * [serialize]=false 時**不進 [ncnnLock]**：OCR 的 Net 以 num_threads=1 建（[Ocr] 並發模式），SimpleOMP 對
      * num_threads==1 的 parallel region 走 inline（simpleomp.cpp `__kmpc_fork_call`：不碰共用 task queue、全域初始化
      * 用 pthread_once）→ 多條 strip 可同時 forward，也不會與持鎖中的偵測/去字（走 task queue）互撞。這是 OCR 保住
-     * 「8 行並發快 46%」的前提（ncnnLock 當初是為 libomp 的並發 master abort 加的，SimpleOMP 後偵測/去字仍保守持鎖）。
-     * 非並發模式（num_threads>1）照舊序列化。
+     * 「8 行並發快 46%」的前提。非並發模式（num_threads>1）照舊序列化。
      */
-    fun ocrCtc(handle: Long, chw: FloatArray, w: Int, h: Int, pe: FloatArray, t: Int, idx: IntArray, logp: FloatArray, serialize: Boolean): Int {
-        return if (serialize) {
-            synchronized(ncnnLock) { ocrCtcNative(handle, chw, w, h, pe, t, idx, logp) }
-        } else {
-            ocrCtcNative(handle, chw, w, h, pe, t, idx, logp)
-        }
-    }
+    fun ocrCtc(handle: Long, chw: FloatArray, w: Int, h: Int, pe: FloatArray, t: Int, idx: IntArray, logp: FloatArray, serialize: Boolean): Int =
+        forward(serialize, lowPriority = false) { ocrCtcNative(handle, chw, w, h, pe, t, idx, logp) }
 }

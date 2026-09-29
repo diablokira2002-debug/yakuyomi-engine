@@ -17,6 +17,8 @@ import kotlin.math.roundToInt
 class Detector(
     modelPath: String,
     private val cfg: DetectorConfig = DetectorConfig(),
+    /** Net 的建法與推論路徑；翻譯用預設，夜讀依是否讓路選 [NcnnFlavor.NIGHT_LOCKED]／[NcnnFlavor.NIGHT_FREE]。 */
+    private val flavor: NcnnFlavor = NcnnFlavor.DEFAULT,
 ) : AutoCloseable {
 
     private var ncnnHandle: Long = 0L
@@ -27,9 +29,9 @@ class Detector(
         check(modelPath.endsWith(".param")) { "偵測需 NCNN `.param` 模型：$modelPath" }
         check(NcnnBackend.available) { "NCNN 原生庫未載入，無法偵測" }
         val bin = modelPath.removeSuffix(".param") + ".bin"
-        ncnnHandle = NcnnBackend.createNet(modelPath, bin)
+        ncnnHandle = NcnnBackend.createNet(modelPath, bin, flavor)
         check(ncnnHandle != 0L) { "NCNN 偵測模型載入失敗：$modelPath" }
-        Log.i(TAG, "NCNN detector loaded $modelPath")
+        Log.i(TAG, "NCNN detector loaded $modelPath $flavor")
     }
 
     /**
@@ -44,7 +46,7 @@ class Detector(
         val db = FloatArray(2 * area)
         // ★ mask 尺寸半/全解析平台不定（x86 半解析 inW/2×inH/2、arm64 實測全解析 inW×inH）→ 緩衝配全解析上限、實際尺寸由 rc 回。
         val mask = FloatArray(area)
-        val rc = NcnnBackend.detectDbnet(ncnnHandle, pre.chw, inW, inH, db, mask)
+        val rc = NcnnBackend.detectDbnet(ncnnHandle, pre.chw, inW, inH, db, mask, flavor.serialize, flavor.lowPriority)
         check(rc > 0) {
             if (rc < 0) {
                 "DBNet 尺寸越界：實際 db.w=${(-rc) / 1000} mask.w=${(-rc) % 1000}（緩衝 db=2×${inW}×$inH、mask≤${inW}×$inH）"
