@@ -53,13 +53,19 @@ data class NcnnFlavor(
 interface NcnnLowPriorityHook {
     /**
      * 要不要放棄這次推論：每次前向開始前問一次；上鎖路徑在等翻譯讓出鎖期間約每 [NcnnBackend.LOW_PRIORITY_POLL_MS]
-     * 再問、拿到鎖後正式開跑前再問一次。true → 不進原生、拋 [NcnnForwardAbortedException]（呼叫端丟回待做）。
+     * 再問、拿到鎖後正式開跑前再問一次（這一次在 [aroundLockedForward] 裡、持鎖時問）。true → 不進原生、拋
+     * [NcnnForwardAbortedException]（呼叫端丟回待做）。
      */
     fun shouldAbort(): Boolean
 
     /**
-     * 包住**持有全域鎖**的原生前向本身（不含等鎖、不含 Kotlin 前後處理），例如低優先權執行緒暫時拉回一般優先權，
-     * 免得它拿著鎖慢慢算、翻譯在鎖外乾等。必須恰好呼叫 [block] 一次並回傳它的結果。
+     * 包住**持有全域鎖的整段**：從取全域鎖之前到放開之後（等監視器、拿到鎖後的翻譯複查與 [shouldAbort]、原生前向本身），
+     * 不含翻譯優先閘的等待（等翻譯讓出鎖）與 Kotlin 前後處理。用途例如低優先權執行緒暫時拉回一般優先權，免得它拿著鎖
+     * 慢慢算、翻譯在鎖外乾等——Java 監視器沒辦法在拿到鎖的那一刻才調優先權，所以要在取鎖前就調好、放鎖後才還原，
+     * 持鎖期間才不會有任何一段是低優先權；等監視器是阻塞、不吃 CPU，蓋進來沒有代價。
+     *
+     * 必須恰好呼叫 [block] 一次，並原樣回傳它的結果或讓它的例外往外拋。拿到鎖時翻譯剛好又來了，[block] 會放掉鎖、
+     * 回一個引擎內部的標記（引擎出來後回到翻譯優先閘重等），所以一次推論可能進出本掛鉤不只一次。
      */
     fun <T> aroundLockedForward(block: () -> T): T
 }
@@ -192,11 +198,17 @@ internal object NcnnBackend {
      *
      * **翻譯優先閘**：夜讀的上鎖呼叫（lowPriority）不能擋翻譯。翻譯端從開始等鎖到放鎖期間 [hiWaiters] > 0；夜讀進鎖前先等它
      * 歸零、拿到鎖後再看一次（翻譯剛好又來就放掉重等）→ 翻譯最多只等夜讀當下正在跑的那一個前向。Java 監視器沒有優先權繼承，
-     * 單靠降夜讀執行緒的 nice 會把翻譯卡在低優先權持鎖者後面（優先權倒置）——所以持鎖的那段另外交給
+     * 單靠降夜讀執行緒的 nice 會把翻譯卡在低優先權持鎖者後面（優先權倒置）——所以持鎖的整段（取鎖前到放鎖後）另外交給
      * [NcnnLowPriorityHook.aroundLockedForward]（夜讀在那裡暫時拉回一般優先權）。夜讀帶掛鉤時，等翻譯期間每
      * [LOW_PRIORITY_POLL_MS] 問一次 [NcnnLowPriorityHook.shouldAbort]，暫停／讓路時不必等到翻譯空檔。
      */
     private val ncnnLock = Any()
+
+    /** 目前執行緒是否持有 [ncnnLock]（JVM 測試用：驗證掛鉤包住整段持鎖）。 */
+    internal fun holdsNcnnLock(): Boolean = Thread.holdsLock(ncnnLock)
+
+    /** 帶掛鉤的上鎖路徑：拿到鎖時翻譯又來了 → 放掉鎖、出掛鉤後回到翻譯優先閘重等（見 [forward]）。 */
+    private object RetryGate
 
     /** 翻譯端（非 lowPriority）正在等 [ncnnLock] 或持有它的呼叫數。在 [gateLock] 下改、在 [ncnnLock] 內無鎖讀。 */
     @Volatile
@@ -210,8 +222,11 @@ internal object NcnnBackend {
     private fun <T> forward(flavor: NcnnFlavor, block: () -> T): T =
         forward(flavor.serialize, flavor.lowPriority, flavor.hook, block)
 
-    /** 依 [serialize]／[lowPriority] 跑一次原生推論（見 [ncnnLock] 的翻譯優先閘）；[hook] 見 [NcnnLowPriorityHook]。 */
-    private fun <T> forward(serialize: Boolean, lowPriority: Boolean, hook: NcnnLowPriorityHook?, block: () -> T): T {
+    /**
+     * 依 [serialize]／[lowPriority] 跑一次原生推論（見 [ncnnLock] 的翻譯優先閘）；[hook] 見 [NcnnLowPriorityHook]。
+     * internal 供 JVM 測試（[block] 換成假的前向）；正式呼叫一律經帶 [NcnnFlavor] 的多載。
+     */
+    internal fun <T> forward(serialize: Boolean, lowPriority: Boolean, hook: NcnnLowPriorityHook?, block: () -> T): T {
         if (hook != null && hook.shouldAbort()) throw NcnnForwardAbortedException()
         if (!serialize) return block()
         if (!lowPriority) {
@@ -246,14 +261,29 @@ internal object NcnnBackend {
                 if (hook != null && hook.shouldAbort()) throw NcnnForwardAbortedException()
                 continue
             }
-            synchronized(ncnnLock) {
-                // 拿到鎖時翻譯又來了 → 放掉、讓它先
-                if (hiWaiters == 0) {
-                    if (hook == null) return block()
-                    // 等 ncnnLock 期間（別頁的夜讀前向）可能已經要放棄了；鎖序＝ncnnLock → 呼叫端的鎖（掛鉤不會回頭拿 ncnnLock）
-                    if (hook.shouldAbort()) throw NcnnForwardAbortedException()
-                    return hook.aroundLockedForward(block)
+            if (hook == null) {
+                synchronized(ncnnLock) {
+                    // 拿到鎖時翻譯又來了 → 放掉、讓它先
+                    if (hiWaiters == 0) return block()
                 }
+                continue
+            }
+            // ★ 掛鉤包住整段持鎖（取鎖前進、放鎖後出，見 [NcnnLowPriorityHook.aroundLockedForward]）：拿到鎖才進掛鉤的話，
+            // 取鎖到拉回優先權之間、還原優先權到放鎖之間都是低優先權持鎖，被翻譯那邊的 CPU 工作搶走時翻譯反而在鎖外等它。
+            val r = hook.aroundLockedForward<Any?> {
+                synchronized(ncnnLock) {
+                    if (hiWaiters != 0) {
+                        RetryGate // 拿到鎖時翻譯又來了 → 放掉、讓它先
+                    } else {
+                        // 等 ncnnLock 期間（別頁的夜讀前向）可能已經要放棄了；鎖序＝ncnnLock → 呼叫端的鎖（掛鉤不會回頭拿 ncnnLock）
+                        if (hook.shouldAbort()) throw NcnnForwardAbortedException()
+                        block()
+                    }
+                }
+            }
+            if (r !== RetryGate) {
+                @Suppress("UNCHECKED_CAST")
+                return r as T
             }
         }
     }
