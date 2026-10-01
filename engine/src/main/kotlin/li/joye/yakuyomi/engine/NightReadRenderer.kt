@@ -67,8 +67,9 @@ class NightReadStats {
      */
     var stagesMs: String? = null
     /**
-     * 三檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔開始篩 keep 到輸出 Bitmap 建好；不含分析、不含
-     * sink），例如 `l1=310 l2=- l3=120`；`-`＝與前一檔相同、沒合成（去重）。單檔版不填。
+     * 三檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔 keep 篩完、開始合成，到輸出 Bitmap 建好；不含
+     * 分析、不含 sink），例如 `l1=310 l2=- l3=120`；`-`＝與前一檔相同、沒合成（keep 去重）。keep 篩選（L1 含 plain 判定）
+     * 記在 [stagesMs] 的 `lN.keep` 段，不在這裡。合成了但逐像素與前一檔相同（輸出去重、交 null）的檔照樣有數字。單檔版不填。
      */
     var tierMs: String? = null
 
@@ -172,8 +173,9 @@ object NightReadRenderer {
      *
      * 縮圖、偵測、分割、[beforeRender] 都只做一次（同 lambda 版 [render]），nightread 的分析也只做一次
      * （[NightRead.renderTiers]）；每檔合成完就轉成 ARGB_8888 交給 [sink]，**sink 回傳後立刻 recycle**——同一時間只有一張
-     * 輸出 Bitmap、整頁共用一份 px 緩衝。某檔的 keep 集合與前一檔相同（輸出必定逐位元相同）時不合成、sink 收到 null。
-     * 所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
+     * 輸出 Bitmap、整頁共用一份 px 緩衝。某檔與前一檔逐位元相同時 sink 收到 null：keep 集合相同（輸出必定相同）時
+     * nightread 根本不合成；keep 不同、但合成出來逐像素跟前一檔一樣（47 頁約 2/88 檔）時這裡比對後也交 null、不轉 Bitmap
+     * ——省一次無損編碼與寫檔，閱讀器切到這一檔也知道「沒有差異」。所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
      *
      * 回傳 false＝[beforeRender] 回 false（暫停／讓路），一檔都沒合成、sink 一次都沒叫；true＝三檔都交過 sink（依序、各一次）。
      * [detect]／[segment]／[sink] 拋出的例外照樣往外拋，textMask、縮圖、當下那張 Bitmap 都在 finally 回收。
@@ -339,8 +341,12 @@ object NightReadRenderer {
         }
 
         NightRead.renderTiers(input, params, debug) { k, gray ->
-            if (gray == null) {
+            // 輸出去重：keep 不同、成品卻逐像素跟上一檔相同時也交 null。px 此時裝著上一個交出去那檔的 ARGB（第 0 檔
+            // 一定非 null、一定轉過 Bitmap；被跳過的檔本來就等於再上一檔），比對不配記憶體、每檔幾 ms。
+            val same = gray != null && k > 0 && sameAsLastEmitted(gray, px)
+            if (gray == null || same) {
                 val s0 = System.nanoTime()
+                if (same) tierMs[k] = (s0 - tierStart) / 1_000_000
                 sink(tiers[k], null)
                 val s1 = System.nanoTime()
                 sinkNs += s1 - s0
@@ -397,6 +403,13 @@ object NightReadRenderer {
         val seg = maskFromBitmap(detection.textMask, w, h)
         val chars = Mask(w, h, charMask)
         return NightReadInput(gray, seg, regions, chars, chroma)
+    }
+
+    /** [out] 與 [px]（[toBitmap] 上一次寫進去的灰 ARGB）是否逐像素相同；比的是 [toBitmap] 會寫的值（夾進 0..255）。 */
+    private fun sameAsLastEmitted(out: Gray, px: IntArray): Boolean {
+        val d = out.data
+        for (i in px.indices) if ((px[i] and 0xFF) != d[i].coerceIn(0, 255)) return false
+        return true
     }
 
     /** 輸出：Gray 0..255 → 不透明灰 ARGB 寫進 [px]（重用輸入時的緩衝）→ 新 ARGB_8888 Bitmap（createBitmap 會複製）。 */
