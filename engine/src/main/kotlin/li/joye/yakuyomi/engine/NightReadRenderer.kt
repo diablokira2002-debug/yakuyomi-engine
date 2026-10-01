@@ -7,6 +7,7 @@ import li.joye.yakuyomi.nightread.NightRead
 import li.joye.yakuyomi.nightread.NightReadDebug
 import li.joye.yakuyomi.nightread.NightReadInput
 import li.joye.yakuyomi.nightread.NightReadParams
+import li.joye.yakuyomi.nightread.NightTier
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
 import kotlin.math.floor
 import kotlin.math.max
@@ -44,13 +45,19 @@ class UnionCharSegmenter(private val parts: List<CharSegmenter>) : CharSegmenter
     }
 }
 
-/** [NightReadRenderer.render] 的耗時與縮圖紀錄（毫秒）。一條龍版三段都填；分段版只填 [renderMs]。 */
+/**
+ * [NightReadRenderer.render]／[NightReadRenderer.renderTiers] 的耗時與縮圖紀錄（毫秒）。一條龍版與三檔版三段都填；
+ * 分段版只填 [renderMs]。
+ */
 class NightReadStats {
     /** detector.detect 本身（不含分群、遮罩轉換——那些算進 [renderMs]）。 */
     var detectMs = 0L
     /** charSeg.segment（聯集配方＝各顆相加）。 */
     var maskMs = 0L
-    /** 灰階／彩度、分群 AABB、遮罩轉換、NightRead.render、輸出 Bitmap。 */
+    /**
+     * 灰階／彩度、分群 AABB、遮罩轉換、NightRead.render、輸出 Bitmap。三檔版＝分析＋各檔合成＋各檔轉 Bitmap，
+     * **不含** sink 裡的時間（編碼由呼叫端自己量）。
+     */
     var renderMs = 0L
     /** 頁超過 [NightReadRenderer.MAX_PIXELS] 時縮到的尺寸 (w, h)；沒縮＝null。縮圖本身的時間不計入三段。 */
     var scaledTo: Pair<Int, Int>? = null
@@ -59,6 +66,11 @@ class NightReadStats {
      * 段名＝nightread 的除錯回呼名，時間＝上一個回呼到這一個（同 ProfileTest 的「本段」）。只在傳了 stats 時量。
      */
     var stagesMs: String? = null
+    /**
+     * 三檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔開始篩 keep 到輸出 Bitmap 建好；不含分析、不含
+     * sink），例如 `l1=310 l2=- l3=120`；`-`＝與前一檔相同、沒合成（去重）。單檔版不填。
+     */
+    var tierMs: String? = null
 
     companion object {
         const val STAGE_MIN_MS = 30L
@@ -151,7 +163,67 @@ object NightReadRenderer {
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
         beforeRender: () -> Boolean = { true },
-    ): Bitmap? {
+    ): Bitmap? = withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
+        render(work, detection, chars, params, stats)
+    }
+
+    /**
+     * 三檔一次產生（[NightTier] 的 L1 → L2 → L3，參數＝`tier.apply(base)`；base 只帶亮度等非檔位參數）。
+     *
+     * 縮圖、偵測、分割、[beforeRender] 都只做一次（同 lambda 版 [render]），nightread 的分析也只做一次
+     * （[NightRead.renderTiers]）；每檔合成完就轉成 ARGB_8888 交給 [sink]，**sink 回傳後立刻 recycle**——同一時間只有一張
+     * 輸出 Bitmap、整頁共用一份 px 緩衝。某檔的 keep 集合與前一檔相同（輸出必定逐位元相同）時不合成、sink 收到 null。
+     * 所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
+     *
+     * 回傳 false＝[beforeRender] 回 false（暫停／讓路），一檔都沒合成、sink 一次都沒叫；true＝三檔都交過 sink（依序、各一次）。
+     * [detect]／[segment]／[sink] 拋出的例外照樣往外拋，textMask、縮圖、當下那張 Bitmap 都在 finally 回收。
+     * 輸出尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]），三檔一定同尺寸。
+     * [stats]：detect／mask 同 [render]；[NightReadStats.renderMs] 不含 sink；[NightReadStats.tierMs] 每檔；
+     * [NightReadStats.stagesMs] 的分析段照舊、各檔的段名加檔位前綴（`l2.paintSticker=45`）。
+     *
+     * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），三檔版與單檔 [render] 相同（nightread 共用分析的快取存
+     * 1 bit/px），所以每頁 58 B/px 的估算照用。
+     */
+    fun renderTiers(
+        page: Bitmap,
+        detect: (Bitmap) -> Detection,
+        segment: (Bitmap) -> BooleanArray,
+        base: NightReadParams = NightReadParams(),
+        stats: NightReadStats? = null,
+        extraLines: List<TextLine> = emptyList(),
+        beforeRender: () -> Boolean = { true },
+        sink: (NightTier, Bitmap?) -> Unit,
+    ): Boolean = withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
+        renderTiersOn(work, detection, chars, base, stats, sink)
+    } != null
+
+    /** 三檔版的模型物件版（同一條龍 [render] 的關係）：沒有 beforeRender，所以一定三檔都交過 [sink]。 */
+    fun renderTiers(
+        page: Bitmap,
+        detector: Detector,
+        charSeg: CharSegmenter,
+        base: NightReadParams = NightReadParams(),
+        stats: NightReadStats? = null,
+        extraLines: List<TextLine> = emptyList(),
+        sink: (NightTier, Bitmap?) -> Unit,
+    ) {
+        renderTiers(page, detect = detector::detect, segment = charSeg::segment, base = base, stats = stats,
+            extraLines = extraLines, sink = sink)
+    }
+
+    /**
+     * 縮圖 → 偵測（併 [extraLines]）→ 分割 → [beforeRender] → [body]（在縮後的工作圖上）。[beforeRender] 回 false＝回 null。
+     * textMask 與縮圖在 finally 回收（例外也一樣），[page] 所有權不變。lambda 版 [render] 與 [renderTiers] 共用。
+     */
+    private fun <T : Any> withInference(
+        page: Bitmap,
+        detect: (Bitmap) -> Detection,
+        segment: (Bitmap) -> BooleanArray,
+        stats: NightReadStats?,
+        extraLines: List<TextLine>,
+        beforeRender: () -> Boolean,
+        body: (Bitmap, Detection, BooleanArray) -> T,
+    ): T? {
         val work = scaleToBudget(page, stats)
         try {
             var t = System.nanoTime()
@@ -173,7 +245,7 @@ object NightReadRenderer {
                 val chars = segment(work)
                 stats?.maskMs = (System.nanoTime() - t) / 1_000_000
                 if (!beforeRender()) return null
-                return render(work, detection, chars, params, stats)
+                return body(work, detection, chars)
             } finally {
                 detected.textMask.recycle()
             }
@@ -193,13 +265,115 @@ object NightReadRenderer {
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
     ): Bitmap {
+        val t = System.nanoTime()
+        val px = IntArray(page.width * page.height)
+        val input = toInput(page, detection, charMask, px)
+
+        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；回呼只多做幾次遮罩計數（幾 ms），
+        // 輸出不變。沒傳 stats 就不掛回呼。
+        val marks = if (stats != null) StringBuilder() else null
+        var last = System.nanoTime()
+        val debug: NightReadDebug? = marks?.let { sb ->
+            { stage, _ ->
+                val now = System.nanoTime()
+                val d = (now - last) / 1_000_000
+                last = now
+                if (d >= NightReadStats.STAGE_MIN_MS) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(stage).append('=').append(d)
+                }
+            }
+        }
+        val res = NightRead.render(input, params, debug)
+        stats?.stagesMs = marks?.toString()
+
+        // 輸出：Gray 0..255 → 不透明灰 ARGB；重用 px 當輸出緩衝（省一份 w×h int）
+        val bmp = toBitmap(res.out, px)
+        stats?.renderMs = (System.nanoTime() - t) / 1_000_000
+        return bmp
+    }
+
+    /**
+     * 三檔版的重繪段（工作圖、偵測、人物遮罩已就緒）：一份 [NightReadInput]、一份 px 緩衝給三檔共用；每檔的 Bitmap
+     * 交給 [sink] 後就 recycle。計時見 [renderTiers]。
+     */
+    private fun renderTiersOn(
+        page: Bitmap,
+        detection: Detection,
+        charMask: BooleanArray,
+        base: NightReadParams,
+        stats: NightReadStats?,
+        sink: (NightTier, Bitmap?) -> Unit,
+    ) {
+        val t = System.nanoTime()
+        val px = IntArray(page.width * page.height)
+        val input = toInput(page, detection, charMask, px)
+        val tiers = NightTier.entries
+        val params = tiers.map { it.apply(base) }
+
+        // 計時（只在傳了 stats 時掛回呼）：分析段同單檔；nightread 每檔合成前送 ("tier", k)，之後的段名加檔位前綴，
+        // 那一檔的 tierMs 從這裡量到 Bitmap 建好。sink 的時間從 renderMs 與分段裡扣掉。
+        val marks = if (stats != null) StringBuilder() else null
+        val tierMs = arrayOfNulls<Long>(tiers.size)
+        var last = System.nanoTime()
+        var tierStart = 0L
+        var prefix = ""
+        var sinkNs = 0L
+        fun mark(name: String, now: Long) {
+            val d = (now - last) / 1_000_000
+            last = now
+            if (marks != null && d >= NightReadStats.STAGE_MIN_MS) {
+                if (marks.isNotEmpty()) marks.append(' ')
+                marks.append(name).append('=').append(d)
+            }
+        }
+        val debug: NightReadDebug? = if (stats == null) null else { stage, value ->
+            val now = System.nanoTime()
+            if (stage == "tier") {
+                prefix = tiers[value].key + "."
+                mark(prefix + "keep", now)          // 上一檔交出後到這一檔開始：篩 keep（L1 含 plain 判定）
+                tierStart = now
+            } else {
+                mark(prefix + stage, now)
+            }
+        }
+
+        NightRead.renderTiers(input, params, debug) { k, gray ->
+            if (gray == null) {
+                val s0 = System.nanoTime()
+                sink(tiers[k], null)
+                val s1 = System.nanoTime()
+                sinkNs += s1 - s0
+                last = s1
+            } else {
+                val bmp = toBitmap(gray, px)
+                val s0 = System.nanoTime()
+                tierMs[k] = (s0 - tierStart) / 1_000_000
+                try {
+                    sink(tiers[k], bmp)
+                } finally {
+                    bmp.recycle()
+                }
+                val s1 = System.nanoTime()
+                sinkNs += s1 - s0               // 轉 Bitmap 算進合成；sink（編碼、寫檔）不算
+                last = s1
+            }
+        }
+        stats?.renderMs = (System.nanoTime() - t - sinkNs) / 1_000_000
+        stats?.tierMs = tiers.indices.joinToString(" ") { "${tiers[it].key}=${tierMs[it] ?: "-"}" }
+        stats?.stagesMs = marks?.toString()
+    }
+
+    /**
+     * Bitmap → [NightReadInput]（契約見類別說明）。[px] 是呼叫端的 w×h 緩衝：這裡 getPixels 進去算灰階與彩度，
+     * 之後呼叫端拿它當輸出緩衝（[toBitmap]），整頁只配一份 w×h int。
+     */
+    private fun toInput(page: Bitmap, detection: Detection, charMask: BooleanArray, px: IntArray): NightReadInput {
         val w = page.width
         val h = page.height
         require(charMask.size == w * h) { "charMask 尺寸 ${charMask.size} ≠ 頁面 ${w}×$h" }
-        val t = System.nanoTime()
 
         // 只 getPixels 一次，同一趟迴圈算灰階與彩度（省一次 w×h 掃描）
-        val px = IntArray(w * h)
         page.getPixels(px, 0, w, 0, 0, w, h)
         val gray = Gray(w, h)
         val chroma = Gray(w, h)
@@ -222,34 +396,17 @@ object NightReadRenderer {
         }
         val seg = maskFromBitmap(detection.textMask, w, h)
         val chars = Mask(w, h, charMask)
+        return NightReadInput(gray, seg, regions, chars, chroma)
+    }
 
-        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；回呼只多做幾次遮罩計數（幾 ms），
-        // 輸出不變。沒傳 stats 就不掛回呼。
-        val marks = if (stats != null) StringBuilder() else null
-        var last = System.nanoTime()
-        val debug: NightReadDebug? = marks?.let { sb ->
-            { stage, _ ->
-                val now = System.nanoTime()
-                val d = (now - last) / 1_000_000
-                last = now
-                if (d >= NightReadStats.STAGE_MIN_MS) {
-                    if (sb.isNotEmpty()) sb.append(' ')
-                    sb.append(stage).append('=').append(d)
-                }
-            }
-        }
-        val res = NightRead.render(NightReadInput(gray, seg, regions, chars, chroma), params, debug)
-        stats?.stagesMs = marks?.toString()
-
-        // 輸出：Gray 0..255 → 不透明灰 ARGB；重用 px 當輸出緩衝（省一份 w×h int）
-        val out = res.out.data
+    /** 輸出：Gray 0..255 → 不透明灰 ARGB 寫進 [px]（重用輸入時的緩衝）→ 新 ARGB_8888 Bitmap（createBitmap 會複製）。 */
+    private fun toBitmap(out: Gray, px: IntArray): Bitmap {
+        val d = out.data
         for (i in px.indices) {
-            val v = out[i].coerceIn(0, 255)
+            val v = d[i].coerceIn(0, 255)
             px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
         }
-        val bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
-        stats?.renderMs = (System.nanoTime() - t) / 1_000_000
-        return bmp
+        return Bitmap.createBitmap(px, out.w, out.h, Bitmap.Config.ARGB_8888)
     }
 
     private fun binOf(param: String): String = param.removeSuffix(".param") + ".bin"
