@@ -46,7 +46,7 @@ class UnionCharSegmenter(private val parts: List<CharSegmenter>) : CharSegmenter
 }
 
 /**
- * [NightReadRenderer.render]／[NightReadRenderer.renderTiers] 的耗時與縮圖紀錄（毫秒）。一條龍版與三檔版三段都填；
+ * [NightReadRenderer.render]／[NightReadRenderer.renderTiers] 的耗時與縮圖紀錄（毫秒）。一條龍版與多檔版三段都填；
  * 分段版只填 [renderMs]。
  */
 class NightReadStats {
@@ -55,7 +55,7 @@ class NightReadStats {
     /** charSeg.segment（聯集配方＝各顆相加）。 */
     var maskMs = 0L
     /**
-     * 灰階／彩度、分群 AABB、遮罩轉換、NightRead.render、輸出 Bitmap。三檔版＝分析＋各檔合成＋各檔轉 Bitmap，
+     * 灰階／彩度、分群 AABB、遮罩轉換、NightRead.render、輸出 Bitmap。多檔版＝分析＋各檔合成＋各檔轉 Bitmap，
      * **不含** sink 裡的時間（編碼由呼叫端自己量）。
      */
     var renderMs = 0L
@@ -67,9 +67,10 @@ class NightReadStats {
      */
     var stagesMs: String? = null
     /**
-     * 三檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔 keep 篩完、開始合成，到輸出 Bitmap 建好；不含
-     * 分析、不含 sink），例如 `l1=310 l2=- l3=120`；`-`＝與前一檔相同、沒合成（keep 去重）。keep 篩選（L1 含 plain 判定）
-     * 記在 [stagesMs] 的 `lN.keep` 段，不在這裡。合成了但逐像素與前一檔相同（輸出去重、交 null）的檔照樣有數字。單檔版不填。
+     * 多檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔 keep 篩完、開始合成，到輸出 Bitmap 建好；不含
+     * 分析、不含 sink），依傳入的檔位順序，例如三檔 `l1=310 l2=- l3=120`、產品兩檔 `l2=310 l3=120`；`-`＝與前一檔相同、
+     * 沒合成（keep 去重）。keep 篩選（L1 含 plain 判定）記在 [stagesMs] 的 `lN.keep` 段，不在這裡。合成了但逐像素與前一檔
+     * 相同（輸出去重、交 null）的檔照樣有數字。單檔版不填。
      */
     var tierMs: String? = null
 
@@ -169,21 +170,26 @@ object NightReadRenderer {
     }
 
     /**
-     * 三檔一次產生（[NightTier] 的 L1 → L2 → L3，參數＝`tier.apply(base)`；base 只帶亮度等非檔位參數）。
+     * 多檔一次產生：[tiers] 依給定順序（預設 [NightTier] 全部三檔 L1 → L2 → L3；fork 產品兩檔傳 `[L2, L3]`），
+     * 參數＝`tier.apply(base)`；base 只帶亮度等非檔位參數。
      *
      * 縮圖、偵測、分割、[beforeRender] 都只做一次（同 lambda 版 [render]），nightread 的分析也只做一次
      * （[NightRead.renderTiers]）；每檔合成完就轉成 ARGB_8888 交給 [sink]，**sink 回傳後立刻 recycle**——同一時間只有一張
-     * 輸出 Bitmap、整頁共用一份 px 緩衝。某檔與前一檔逐位元相同時 sink 收到 null：keep 集合相同（輸出必定相同）時
-     * nightread 根本不合成；keep 不同、但合成出來逐像素跟前一檔一樣（47 頁約 2/88 檔）時這裡比對後也交 null、不轉 Bitmap
-     * ——省一次無損編碼與寫檔，閱讀器切到這一檔也知道「沒有差異」。所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
+     * 輸出 Bitmap、整頁共用一份 px 緩衝。去重一律對「上一個交出的檔」（[tiers] 裡的前一檔，不是 L 編號的前一檔）：
+     * **第一檔一定非 null**；之後某檔與前一檔逐位元相同時 sink 收到 null——keep 集合相同（輸出必定相同）時 nightread 根本
+     * 不合成；keep 不同、但合成出來逐像素跟前一檔一樣（47 頁約 2/88 檔）時這裡比對後也交 null、不轉 Bitmap——省一次無損
+     * 編碼與寫檔，閱讀器切到這一檔也知道「沒有差異」。所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
+     * 每檔交出的成品與單檔 `render(tier.apply(base))` 逐位元相同，跟 [tiers] 裡有沒有別檔無關（NightReadTiersTest 守
+     * `[L2, L3]` 與三檔版的 L2／L3 相同）。
      *
-     * 回傳 false＝[beforeRender] 回 false（暫停／讓路），一檔都沒合成、sink 一次都沒叫；true＝三檔都交過 sink（依序、各一次）。
+     * 回傳 false＝[beforeRender] 回 false（暫停／讓路），一檔都沒合成、sink 一次都沒叫；true＝[tiers] 每檔都交過 sink
+     * （依序、各一次）。[tiers] 不得為空（推論前就拋 [IllegalArgumentException]）。
      * [detect]／[segment]／[sink] 拋出的例外照樣往外拋，textMask、縮圖、當下那張 Bitmap 都在 finally 回收。
-     * 輸出尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]），三檔一定同尺寸。
+     * 輸出尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]），各檔一定同尺寸。
      * [stats]：detect／mask 同 [render]；[NightReadStats.renderMs] 不含 sink；[NightReadStats.tierMs] 每檔；
      * [NightReadStats.stagesMs] 的分析段照舊、各檔的段名加檔位前綴（`l2.paintSticker=45`）。
      *
-     * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），三檔版與單檔 [render] 相同（nightread 共用分析的快取存
+     * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），多檔版與單檔 [render] 相同（nightread 共用分析的快取存
      * 1 bit/px），所以每頁 58 B/px 的估算照用。
      */
     fun renderTiers(
@@ -194,12 +200,16 @@ object NightReadRenderer {
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
         beforeRender: () -> Boolean = { true },
+        tiers: List<NightTier> = NightTier.entries,
         sink: (NightTier, Bitmap?) -> Unit,
-    ): Boolean = withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
-        renderTiersOn(work, detection, chars, base, stats, sink)
-    } != null
+    ): Boolean {
+        require(tiers.isNotEmpty()) { "renderTiers：至少要一檔" }
+        return withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
+            renderTiersOn(work, detection, chars, base, tiers, stats, sink)
+        } != null
+    }
 
-    /** 三檔版的模型物件版（同一條龍 [render] 的關係）：沒有 beforeRender，所以一定三檔都交過 [sink]。 */
+    /** 多檔版的模型物件版（同一條龍 [render] 的關係）：沒有 beforeRender，所以 [tiers] 每檔一定都交過 [sink]。 */
     fun renderTiers(
         page: Bitmap,
         detector: Detector,
@@ -207,10 +217,11 @@ object NightReadRenderer {
         base: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
+        tiers: List<NightTier> = NightTier.entries,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         renderTiers(page, detect = detector::detect, segment = charSeg::segment, base = base, stats = stats,
-            extraLines = extraLines, sink = sink)
+            extraLines = extraLines, tiers = tiers, sink = sink)
     }
 
     /**
@@ -296,22 +307,21 @@ object NightReadRenderer {
     }
 
     /**
-     * 三檔版的重繪段（工作圖、偵測、人物遮罩已就緒）：一份 [NightReadInput]、一份 px 緩衝給三檔共用；每檔的 Bitmap
-     * 交給 [sink] 後就 recycle。計時見 [renderTiers]。
+     * 多檔版的重繪段（工作圖、偵測、人物遮罩已就緒）：一份 [NightReadInput]、一份 px 緩衝給各檔共用；去重在
+     * [streamTiers]，這裡只轉 Bitmap、交 [sink]（交完就 recycle）與計時。計時見 [renderTiers]。
      */
     private fun renderTiersOn(
         page: Bitmap,
         detection: Detection,
         charMask: BooleanArray,
         base: NightReadParams,
+        tiers: List<NightTier>,
         stats: NightReadStats?,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         val t = System.nanoTime()
         val px = IntArray(page.width * page.height)
         val input = toInput(page, detection, charMask, px)
-        val tiers = NightTier.entries
-        val params = tiers.map { it.apply(base) }
 
         // 計時（只在傳了 stats 時掛回呼）：分析段同單檔；nightread 每檔合成前送 ("tier", k)，之後的段名加檔位前綴，
         // 那一檔的 tierMs 從這裡量到 Bitmap 建好。sink 的時間從 renderMs 與分段裡扣掉。
@@ -340,19 +350,17 @@ object NightReadRenderer {
             }
         }
 
-        NightRead.renderTiers(input, params, debug) { k, gray ->
-            // 輸出去重：keep 不同、成品卻逐像素跟上一檔相同時也交 null。px 此時裝著上一個交出去那檔的 ARGB（第 0 檔
-            // 一定非 null、一定轉過 Bitmap；被跳過的檔本來就等於再上一檔），比對不配記憶體、每檔幾 ms。
-            val same = gray != null && k > 0 && sameAsLastEmitted(gray, px)
-            if (gray == null || same) {
+        streamTiers(input, tiers, base, px, debug) { k, emitted, composed ->
+            if (!emitted) {
                 val s0 = System.nanoTime()
-                if (same) tierMs[k] = (s0 - tierStart) / 1_000_000
+                if (composed) tierMs[k] = (s0 - tierStart) / 1_000_000
                 sink(tiers[k], null)
                 val s1 = System.nanoTime()
                 sinkNs += s1 - s0
                 last = s1
             } else {
-                val bmp = toBitmap(gray, px)
+                // px 已由 streamTiers 寫好這一檔的 ARGB；createBitmap 會複製
+                val bmp = Bitmap.createBitmap(px, page.width, page.height, Bitmap.Config.ARGB_8888)
                 val s0 = System.nanoTime()
                 tierMs[k] = (s0 - tierStart) / 1_000_000
                 try {
@@ -368,6 +376,37 @@ object NightReadRenderer {
         stats?.renderMs = (System.nanoTime() - t - sinkNs) / 1_000_000
         stats?.tierMs = tiers.indices.joinToString(" ") { "${tiers[it].key}=${tierMs[it] ?: "-"}" }
         stats?.stagesMs = marks?.toString()
+    }
+
+    /**
+     * 多檔去重的核心（不碰 Bitmap，JVM 單元測試 NightReadTiersTest 直接打）：[tiers] 依給定順序套 `tier.apply(base)`
+     * 交給 [NightRead.renderTiers]，每檔依序回呼 [out] 一次 `(k, emitted, composed)`，k＝[tiers] 裡的索引：
+     *  - emitted＝true：與上一個交出的檔不同，[px] 已寫好這一檔的不透明灰 ARGB（呼叫端轉 Bitmap）。第 0 檔一定是這種。
+     *  - emitted＝false：與上一個交出的檔逐像素相同，不交圖。composed＝false 是 keep 集合相同（nightread 沒合成）；
+     *    true 是合成了、但這裡比對後逐像素相同（輸出去重）。
+     * [px]＝w×h 緩衝（呼叫端 [toInput] 用過的那份即可，第 0 檔前的內容不讀）；回呼之間它一直裝著最後交出那檔的 ARGB，
+     * 比對靠它、不另配記憶體——所以呼叫端在 [out] 裡只能讀 [px]、不得改寫。
+     */
+    internal fun streamTiers(
+        input: NightReadInput,
+        tiers: List<NightTier>,
+        base: NightReadParams,
+        px: IntArray,
+        debug: NightReadDebug?,
+        out: (k: Int, emitted: Boolean, composed: Boolean) -> Unit,
+    ) {
+        NightRead.renderTiers(input, tiers.map { it.apply(base) }, debug) { k, gray ->
+            when {
+                gray == null -> out(k, false, false)
+                // 輸出去重：keep 不同、成品卻逐像素跟上一個交出的檔相同時也不交。第 0 檔一定非 null、一定寫進 px；
+                // 被跳過的檔本來就等於再上一檔，所以 px 永遠是「上一個交出的檔」。比對不配記憶體、每檔幾 ms。
+                k > 0 && sameAsLastEmitted(gray, px) -> out(k, false, true)
+                else -> {
+                    writeArgb(gray, px)
+                    out(k, true, true)
+                }
+            }
+        }
     }
 
     /**
@@ -414,12 +453,17 @@ object NightReadRenderer {
 
     /** 輸出：Gray 0..255 → 不透明灰 ARGB 寫進 [px]（重用輸入時的緩衝）→ 新 ARGB_8888 Bitmap（createBitmap 會複製）。 */
     private fun toBitmap(out: Gray, px: IntArray): Bitmap {
+        writeArgb(out, px)
+        return Bitmap.createBitmap(px, out.w, out.h, Bitmap.Config.ARGB_8888)
+    }
+
+    /** Gray 0..255（夾進範圍）→ 不透明灰 ARGB 寫進 [px]。 */
+    private fun writeArgb(out: Gray, px: IntArray) {
         val d = out.data
         for (i in px.indices) {
             val v = d[i].coerceIn(0, 255)
             px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
         }
-        return Bitmap.createBitmap(px, out.w, out.h, Bitmap.Config.ARGB_8888)
     }
 
     private fun binOf(param: String): String = param.removeSuffix(".param") + ".bin"
