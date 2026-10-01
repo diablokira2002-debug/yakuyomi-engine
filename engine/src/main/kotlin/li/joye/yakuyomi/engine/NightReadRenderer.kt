@@ -69,8 +69,9 @@ class NightReadStats {
     /**
      * 多檔版（[NightReadRenderer.renderTiers]）每檔的合成耗時（ms，從該檔 keep 篩完、開始合成，到輸出 Bitmap 建好；不含
      * 分析、不含 sink），依傳入的檔位順序，例如三檔 `l1=310 l2=- l3=120`、產品兩檔 `l2=310 l3=120`；`-`＝與前一檔相同、
-     * 沒合成（keep 去重）。keep 篩選（L1 含 plain 判定）記在 [stagesMs] 的 `lN.keep` 段，不在這裡。合成了但逐像素與前一檔
-     * 相同（輸出去重、交 null）的檔照樣有數字。單檔版不填。
+     * 沒合成（keep 去重）。keep 篩選記在 [stagesMs] 的 `lN.keep` 段，不在這裡；plain 判定（與檔位無關、只算一次）落在
+     * 第一個用到它的檔（三檔＝L1、產品兩檔＝L2）的 `.keep` 段。合成了但逐像素與前一檔相同（輸出去重、交 null）的檔照樣
+     * 有數字。單檔版不填。
      */
     var tierMs: String? = null
 
@@ -343,7 +344,7 @@ object NightReadRenderer {
             val now = System.nanoTime()
             if (stage == "tier") {
                 prefix = tiers[value].key + "."
-                mark(prefix + "keep", now)          // 上一檔交出後到這一檔開始：篩 keep（L1 含 plain 判定）
+                mark(prefix + "keep", now)          // 上一檔交出後到這一檔開始：篩 keep（第一個用到 plain 的檔含 plain 判定）
                 tierStart = now
             } else {
                 mark(prefix + stage, now)
