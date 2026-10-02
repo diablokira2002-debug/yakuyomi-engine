@@ -171,15 +171,16 @@ object NightReadRenderer {
     }
 
     /**
-     * 多檔一次產生：[tiers] 依給定順序（預設 [NightTier] 全部三檔 L1 → L2 → L3；fork 產品兩檔傳 `[L2, L3]`），
-     * 參數＝`tier.apply(base)`；base 只帶亮度等非檔位參數。
+     * 多檔一次產生：[tiers] 依給定順序（預設 [NightTier] 全部三檔 L1 → L2 → L3；fork 產品兩檔傳 `[L2, L3]`＝「標準」與
+     * 「更多」，L3 含「更多」新規則 A2），參數＝`tier.apply(base)`；base 只帶亮度等非檔位參數。
      *
      * 縮圖、偵測、分割、[beforeRender] 都只做一次（同 lambda 版 [render]），nightread 的分析也只做一次
      * （[NightRead.renderTiers]）；每檔合成完就轉成 ARGB_8888 交給 [sink]，**sink 回傳後立刻 recycle**——同一時間只有一張
      * 輸出 Bitmap、整頁共用一份 px 緩衝。去重一律對「上一個交出的檔」（[tiers] 裡的前一檔，不是 L 編號的前一檔）：
-     * **第一檔一定非 null**；之後某檔與前一檔逐位元相同時 sink 收到 null——keep 集合相同（輸出必定相同）時 nightread 根本
-     * 不合成；keep 不同、但合成出來逐像素跟前一檔一樣（47 頁約 2/88 檔）時這裡比對後也交 null、不轉 Bitmap——省一次無損
-     * 編碼與寫檔，閱讀器切到這一檔也知道「沒有差異」。所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
+     * **第一檔一定非 null**；之後某檔與前一檔逐位元相同時 sink 收到 null——合成鍵（keep 集合，加上「更多」的繪製開關）相同
+     * （輸出必定相同）時 nightread 根本不合成；合成了、但逐像素跟前一檔一樣（keep 不同而成品相同，或「更多」keep 與「標準」
+     * 相同、繪製開關沒改到任何像素）時這裡比對後也交 null、不轉 Bitmap——省一次無損編碼與寫檔，閱讀器切到這一檔也知道
+     * 「沒有差異」。所以 **sink 不得留住 Bitmap**：要寫檔就在 sink 裡寫完。
      * 每檔交出的成品與單檔 `render(tier.apply(base))` 逐位元相同，跟 [tiers] 裡有沒有別檔無關（NightReadTiersTest 守
      * `[L2, L3]` 與三檔版的 L2／L3 相同）。
      *
@@ -383,7 +384,7 @@ object NightReadRenderer {
      * 多檔去重的核心（不碰 Bitmap，JVM 單元測試 NightReadTiersTest 直接打）：[tiers] 依給定順序套 `tier.apply(base)`
      * 交給 [NightRead.renderTiers]，每檔依序回呼 [out] 一次 `(k, emitted, composed)`，k＝[tiers] 裡的索引：
      *  - emitted＝true：與上一個交出的檔不同，[px] 已寫好這一檔的不透明灰 ARGB（呼叫端轉 Bitmap）。第 0 檔一定是這種。
-     *  - emitted＝false：與上一個交出的檔逐像素相同，不交圖。composed＝false 是 keep 集合相同（nightread 沒合成）；
+     *  - emitted＝false：與上一個交出的檔逐像素相同，不交圖。composed＝false 是合成鍵相同（nightread 沒合成）；
      *    true 是合成了、但這裡比對後逐像素相同（輸出去重）。
      * [px]＝w×h 緩衝（呼叫端 [toInput] 用過的那份即可，第 0 檔前的內容不讀）；回呼之間它一直裝著最後交出那檔的 ARGB，
      * 比對靠它、不另配記憶體——所以呼叫端在 [out] 裡只能讀 [px]、不得改寫。

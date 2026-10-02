@@ -15,7 +15,8 @@ import java.io.File
 import javax.imageio.ImageIO
 
 /**
- * [NightReadRenderer.streamTiers]（多檔版的去重核心，不碰 Bitmap）：產品兩檔 `[L2, L3]` 對照完整三檔。
+ * [NightReadRenderer.streamTiers]（多檔版的去重核心，不碰 Bitmap）：產品兩檔 `[L2, L3]`（「標準」與「更多」；L3 含「更多」
+ * 新規則 A2；keep 與 L2 相同、但有貼紙要塗時 nightread 照樣合成，由這裡逐像素去重）對照完整三檔。
  *  - 第一檔（L2）一定交圖，而且與三檔版的 L2 逐像素相同；
  *  - L3 交 null ⇔ 它與 L2 逐像素相同；交圖時與三檔版的 L3 逐像素相同。
  * 三檔版沒交圖的檔取上一個交出的檔（[resolve]）——那樣去重在建構上正確，由函式庫的 SharedTierTest 對單檔 render 守。
