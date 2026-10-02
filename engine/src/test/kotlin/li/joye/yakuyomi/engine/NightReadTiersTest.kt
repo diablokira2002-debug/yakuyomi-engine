@@ -20,7 +20,8 @@ import javax.imageio.ImageIO
  *  - 第一檔（L2）一定交圖，而且與三檔版的 L2 逐像素相同；
  *  - L3 交 null ⇔ 它與 L2 逐像素相同；交圖時與三檔版的 L3 逐像素相同。
  * 三檔版沒交圖的檔取上一個交出的檔（[resolve]）——那樣去重在建構上正確，由函式庫的 SharedTierTest 對單檔 render 守。
- * 兩條分支（L3 交圖／交 null）都要有頁走到，見 [twoTiersMatchThreeTierRun]。
+ * 兩條分支（L3 交圖／交 null）都要有頁走到，見 [twoTiersMatchThreeTierRun]；「合成了、逐像素相同、不交」那條另由
+ * [composedButIdenticalTierIsNotEmitted] 守。
  * fixture＝nightread 函式庫的頁 fixture（engine 的巢狀 submodule `yakuyomi-nightread`，同 SharedTierTest 的讀法）。
  */
 class NightReadTiersTest {
@@ -112,6 +113,25 @@ class NightReadTiersTest {
         val emitted = listOf("ch34_011", "demo02", "demo05", "demo06").map(::checkPage)
         assertTrue("至少一頁 L3 ≠ L2（交圖分支）", emitted.any { it })
         assertTrue("至少一頁 L3 ＝ L2（交 null 分支）", emitted.any { !it })
+    }
+
+    /**
+     * 輸出去重那條分支（合成了、但不交圖）：demo01 的「更多」合成鍵與 L2 不同——nightread 照樣合成——成品卻與 L2 逐像素相同
+     * （多收的元件核心填色是空的），所以 streamTiers 比對後回呼 `emitted＝false, composed＝true`，而且 px 仍裝著 L2。
+     * [twoTiersMatchThreeTierRun] 那四頁裡 L3＝L2 的都是合成鍵相同（nightread 根本沒合成），走不到這條。
+     * 這頁哪天不再是這種情況，要換一頁（函式庫 SharedTierTest.composedTierMayEqualPreviousTier 守同一件事）。
+     */
+    @Test
+    fun composedButIdenticalTierIsNotEmitted() {
+        val inp = input("demo01")
+        val px = IntArray(inp.gray.w * inp.gray.h)
+        val seen = ArrayList<Triple<Int, Boolean, Boolean>>()
+        var l2: IntArray? = null
+        NightReadRenderer.streamTiers(inp, listOf(NightTier.L2, NightTier.L3), NightReadParams(), px, debug = null) { k, emitted, composed ->
+            seen += Triple(k, emitted, composed)
+            if (k == 0) l2 = px.copyOf() else assertArrayEquals("demo01：沒交圖時 px 仍是上一個交出的檔（L2）", l2, px)
+        }
+        assertEquals(listOf(Triple(0, true, true), Triple(1, false, true)), seen)
     }
 
     @Test
