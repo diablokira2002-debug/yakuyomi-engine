@@ -16,7 +16,7 @@ android {
         minSdk = 26
         consumerProguardFiles("consumer-rules.pro")
 
-        // NCNN 原生後端（去字／偵測／OCR，引擎唯一的推論 runtime；ORT 2026-09-26 拔除）：只出 arm64（ncnn 預編庫即 arm64-v8a Vulkan 版）
+        // NCNN 原生後端（去字／偵測／OCR／人物分割，引擎唯一的推論 runtime；ORT 2026-09-26 拔除）：只出 arm64（ncnn 預編庫＝arm64-v8a、SimpleOMP、不含 Vulkan）
         ndk {
             abiFilters += "arm64-v8a"
         }
