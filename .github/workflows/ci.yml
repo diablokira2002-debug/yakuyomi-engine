@@ -27,8 +27,12 @@ jobs:
           java-version: "21"
 
       # 裝 cmdline-tools 並接受授權；compileSdk 由 AGP 依需求自動下載。
+      # packages 要明寫：這個 action 預設會跑 `sdkmanager tools`，新版 cmdline-tools 已經沒有 `tools` 這個套件
+      # （Failed to find package 'tools' → exit 1，後面的步驟全部跳過；2026-09-17 起 CI 因此一直紅）。
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       # 引擎的 NCNN 原生層需要 NDK + CMake（externalNativeBuild）；釘住與 engine/build.gradle.kts 一致的版本。
       - name: Install NDK + CMake
