@@ -9,6 +9,7 @@ import li.joye.yakuyomi.nightread.NightReadInput
 import li.joye.yakuyomi.nightread.NightReadParams
 import li.joye.yakuyomi.nightread.NightTier
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -91,8 +92,11 @@ class NightReadStats {
  *  3. `seg` 要涵蓋**所有**文字（含 SFX／裝飾字，即使翻譯不處理）——這裡不濾任何區域、不看 OCR 結果。
  *  4. `charMask`＝分割模型**原輸出**（不收邊、不平滑；貼墨收邊與偽泡判定由管線自己做）。
  *  5. `regions`＝[Grouping.group] 後每個 [TextRegion] 的軸對齊 bbox（Float → Int、夾進頁面）。
+ *  6. `inpaintMask`＝呼叫端給的譯後頁去字遮罩（翻譯素材 `<頁>.mask.png`）最近鄰對應到實際跑的尺寸；日文頁／沒有素材＝null
+ *     （nightread 規則版本 4，只有「更多」看它）。
  *
- * **資源**：每頁在飛約 58 B/px 的 Java heap（重繪內部尖峰約 43 B/px ＋ 包裝層的 px/gray/chroma/seg/char），7 MPx 頁要
+ * **資源**：每頁在飛約 58 B/px 的 Java heap（重繪內部尖峰約 43 B/px ＋ 包裝層的 px/gray/chroma/seg/char；帶去字遮罩的頁
+ * 再多約 1.1 B/px），7 MPx 頁要
  * 20 s 以上，所以 [render] 一條龍版把超過 [MAX_PIXELS] 的頁先等比縮到預算內再跑（偵測／分割／重繪都在縮圖上），
  * **輸出＝縮後尺寸**（夜讀是離線預算不是即時：真機一頁 6–25 s）。
  * **併發**：可以多頁並行——這裡與 nightread 函式庫都沒有共享可變狀態（函式庫已驗可重入：多緒 render 與單緒逐像素相同）。
@@ -138,6 +142,13 @@ object NightReadRenderer {
      * 用途＝譯後頁：翻譯素材裡的原文行框比譯文大、也涵蓋 DBNet 對短譯文抓不到的泡（「咦」「是的」），併進來
      * 既補偵測漏、又把「泡面積：字框長邊²」的分母拉大（見 nightread docs/DECISIONS「譯後頁的泡」）。
      * 只影響文字區（bbox）；筆畫遮罩仍是偵測器對這頁的輸出。
+     *
+     * [inpaintMask]：譯後頁的去字遮罩（翻譯素材 `.yakuyomi/<頁>.mask.png`；白＝去字區，看藍通道 > 127），給 nightread「更多」
+     * 的孤島規則（規則版本 4：去字區旁的小塊不塗，`NightReadInput.inpaintMask`）。**蓋住整張 [page]**（同 [extraLines] 的
+     * [page] 座標）：尺寸可以與 [page] 差幾個像素（降採樣解碼的取整），長寬比要一致（[maskFitsPage]，不一致＝拋
+     * [IllegalArgumentException]、推論前就拋）；引擎以最近鄰把它對應到實際跑的尺寸（縮圖時跟頁一起縮，與研究端
+     * `cv2.resize(INTER_NEAREST)` 同式，見 [resampleMask]）。null＝日文頁／沒有素材，與規則版本 3 相同；全空的遮罩也一樣。
+     * 「標準」不看它。所有權不變（不 recycle），只在重繪前讀一次（逐列讀，不配整張 int 緩衝）。
      */
     fun render(
         page: Bitmap,
@@ -146,14 +157,19 @@ object NightReadRenderer {
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
+        inpaintMask: Bitmap? = null,
     ): Bitmap = checkNotNull(
-        render(page, detect = detector::detect, segment = charSeg::segment, params = params, stats = stats, extraLines = extraLines),
+        render(
+            page, detect = detector::detect, segment = charSeg::segment, params = params, stats = stats,
+            extraLines = extraLines, inpaintMask = inpaintMask,
+        ),
     )
 
     /**
      * lambda 版一條龍（上面那版委派到這裡）：推論由呼叫端的 [detect]／[segment] 做，好讓呼叫端在每次推論前插自己的
-     * 檢查點（例如 fork 夜讀的暫停／讓路）；縮圖、併 [extraLines]、回收 textMask 與縮圖的邏輯都留在這裡。
+     * 檢查點（例如 fork 夜讀的暫停／讓路）；縮圖、併 [extraLines]、對應 [inpaintMask]、回收 textMask 與縮圖的邏輯都留在這裡。
      * [detect]／[segment] 拋出的例外（含 [NcnnForwardAbortedException]）照樣往外拋，textMask 與縮圖在 finally 回收。
+     * [inpaintMask] 見上面那版。
      *
      * [beforeRender]：推論做完、進入 Kotlin 重繪（一頁最貴的一段，數秒）之前呼叫一次。回 false＝放棄這頁 → 回 null，
      * finally 照樣回收 textMask 與縮圖（呼叫端用來在暫停／讓路時丟回待做、把 heap 放掉）。
@@ -165,9 +181,10 @@ object NightReadRenderer {
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
+        inpaintMask: Bitmap? = null,
         beforeRender: () -> Boolean = { true },
-    ): Bitmap? = withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
-        render(work, detection, chars, params, stats)
+    ): Bitmap? = withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
+        render(work, detection, chars, params, stats, inpaintMask)
     }
 
     /**
@@ -190,9 +207,11 @@ object NightReadRenderer {
      * 輸出尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]），各檔一定同尺寸。
      * [stats]：detect／mask 同 [render]；[NightReadStats.renderMs] 不含 sink；[NightReadStats.tierMs] 每檔；
      * [NightReadStats.stagesMs] 的分析段照舊、各檔的段名加檔位前綴（`l2.paintSticker=45`）。
+     * [inpaintMask] 同一條龍 [render]（只有「更多」看它）。
      *
      * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），多檔版與單檔 [render] 相同（nightread 共用分析的快取存
-     * 1 bit/px），所以每頁 58 B/px 的估算照用。
+     * 1 bit/px），所以每頁 58 B/px 的估算照用；帶 [inpaintMask] 的頁多 1 B/px（轉成的布林遮罩）＋函式庫內部位元版 1/8 B/px
+     * （遮罩 Bitmap 本身的像素在 native）。
      */
     fun renderTiers(
         page: Bitmap,
@@ -201,13 +220,14 @@ object NightReadRenderer {
         base: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
+        inpaintMask: Bitmap? = null,
         beforeRender: () -> Boolean = { true },
         tiers: List<NightTier> = NightTier.entries,
         sink: (NightTier, Bitmap?) -> Unit,
     ): Boolean {
         require(tiers.isNotEmpty()) { "renderTiers：至少要一檔" }
-        return withInference(page, detect, segment, stats, extraLines, beforeRender) { work, detection, chars ->
-            renderTiersOn(work, detection, chars, base, tiers, stats, sink)
+        return withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
+            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, sink)
         } != null
     }
 
@@ -219,16 +239,18 @@ object NightReadRenderer {
         base: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
+        inpaintMask: Bitmap? = null,
         tiers: List<NightTier> = NightTier.entries,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         renderTiers(page, detect = detector::detect, segment = charSeg::segment, base = base, stats = stats,
-            extraLines = extraLines, tiers = tiers, sink = sink)
+            extraLines = extraLines, inpaintMask = inpaintMask, tiers = tiers, sink = sink)
     }
 
     /**
      * 縮圖 → 偵測（併 [extraLines]）→ 分割 → [beforeRender] → [body]（在縮後的工作圖上）。[beforeRender] 回 false＝回 null。
      * textMask 與縮圖在 finally 回收（例外也一樣），[page] 所有權不變。lambda 版 [render] 與 [renderTiers] 共用。
+     * [inpaintMask] 只在這裡驗與 [page] 對得上（推論前，免得白跑一頁才拋）；對應到工作圖尺寸在 [body] 裡（[toInput]）。
      */
     private fun <T : Any> withInference(
         page: Bitmap,
@@ -236,9 +258,11 @@ object NightReadRenderer {
         segment: (Bitmap) -> BooleanArray,
         stats: NightReadStats?,
         extraLines: List<TextLine>,
+        inpaintMask: Bitmap?,
         beforeRender: () -> Boolean,
         body: (Bitmap, Detection, BooleanArray) -> T,
     ): T? {
+        inpaintMask?.let { requireFitsPage(it, page) }
         val work = scaleToBudget(page, stats)
         try {
             var t = System.nanoTime()
@@ -247,13 +271,7 @@ object NightReadRenderer {
             val detection = if (extraLines.isEmpty()) {
                 detected
             } else {
-                val s = work.width.toFloat() / page.width
-                val extra = if (s == 1f) {
-                    extraLines
-                } else {
-                    extraLines.map { l -> TextLine(l.quad.map { Pt(it.x * s, it.y * s) }, l.score) }
-                }
-                Detection(detected.lines + extra, detected.textMask)
+                Detection(detected.lines + scaleLines(extraLines, work.width.toFloat() / page.width), detected.textMask)
             }
             try {
                 t = System.nanoTime()
@@ -272,6 +290,7 @@ object NightReadRenderer {
     /**
      * 分段版：呼叫端已有**同尺寸**的 [detection]（[Detector.detect] 對 [page] 的結果）與 [charMask]（w×h、true＝人物）。
      * 不縮圖（素材尺寸已綁死在 page 上，要縮得在偵測前縮）、不 recycle [Detection.textMask]；只填 [NightReadStats.renderMs]。
+     * [inpaintMask] 同一條龍 [render]（蓋住整張 [page]、最近鄰對應到 [page] 尺寸；對不上拋 [IllegalArgumentException]）。
      */
     fun render(
         page: Bitmap,
@@ -279,10 +298,12 @@ object NightReadRenderer {
         charMask: BooleanArray,
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
+        inpaintMask: Bitmap? = null,
     ): Bitmap {
         val t = System.nanoTime()
+        inpaintMask?.let { requireFitsPage(it, page) }
         val px = IntArray(page.width * page.height)
-        val input = toInput(page, detection, charMask, px)
+        val input = toInput(page, detection, charMask, px, inpaintMask)
 
         // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；回呼只多做幾次遮罩計數（幾 ms），
         // 輸出不變。沒傳 stats 就不掛回呼。
@@ -319,11 +340,12 @@ object NightReadRenderer {
         base: NightReadParams,
         tiers: List<NightTier>,
         stats: NightReadStats?,
+        inpaintMask: Bitmap?,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         val t = System.nanoTime()
         val px = IntArray(page.width * page.height)
-        val input = toInput(page, detection, charMask, px)
+        val input = toInput(page, detection, charMask, px, inpaintMask)
 
         // 計時（只在傳了 stats 時掛回呼）：分析段同單檔；nightread 每檔合成前送 ("tier", k)，之後的段名加檔位前綴，
         // 那一檔的 tierMs 從這裡量到 Bitmap 建好。sink 的時間從 renderMs 與分段裡扣掉。
@@ -414,8 +436,16 @@ object NightReadRenderer {
     /**
      * Bitmap → [NightReadInput]（契約見類別說明）。[px] 是呼叫端的 w×h 緩衝：這裡 getPixels 進去算灰階與彩度，
      * 之後呼叫端拿它當輸出緩衝（[toBitmap]），整頁只配一份 w×h int。
+     * [inpaintMask]（蓋住整頁、呼叫端已驗過 [requireFitsPage]）以最近鄰對應到 [page] 尺寸（[page] 是縮後的工作圖時就是跟著
+     * 縮）→ `NightReadInput.inpaintMask`。
      */
-    private fun toInput(page: Bitmap, detection: Detection, charMask: BooleanArray, px: IntArray): NightReadInput {
+    private fun toInput(
+        page: Bitmap,
+        detection: Detection,
+        charMask: BooleanArray,
+        px: IntArray,
+        inpaintMask: Bitmap?,
+    ): NightReadInput {
         val w = page.width
         val h = page.height
         require(charMask.size == w * h) { "charMask 尺寸 ${charMask.size} ≠ 頁面 ${w}×$h" }
@@ -443,7 +473,8 @@ object NightReadRenderer {
         }
         val seg = maskFromBitmap(detection.textMask, w, h)
         val chars = Mask(w, h, charMask)
-        return NightReadInput(gray, seg, regions, chars, chroma)
+        val inpaint = inpaintMask?.let { maskFromBitmap(it, w, h) }
+        return NightReadInput(gray, seg, regions, chars, chroma, inpaint)
     }
 
     /** [out] 與 [px]（[toBitmap] 上一次寫進去的灰 ARGB）是否逐像素相同；比的是 [toBitmap] 會寫的值（夾進 0..255）。 */
@@ -476,38 +507,75 @@ object NightReadRenderer {
      * 沒縮時回傳 page 本身——呼叫端以 `!==` 判斷要不要 recycle（createScaledBitmap 同尺寸時也會回同一物件，別誤 recycle 原圖）。
      */
     private fun scaleToBudget(page: Bitmap, stats: NightReadStats?): Bitmap {
-        val n = page.width.toLong() * page.height
-        if (n <= MAX_PIXELS) return page
-        val s = sqrt(MAX_PIXELS.toDouble() / n)
-        val nw = max(1, floor(page.width * s).toInt())
-        val nh = max(1, floor(page.height * s).toInt())
+        val (nw, nh) = budgetSize(page.width, page.height) ?: return page
         stats?.scaledTo = nw to nh
         return Bitmap.createScaledBitmap(page, nw, nh, true)
     }
 
+    /** [scaleToBudget] 的尺寸算術（JVM 可測）：像素數 ≤ [MAX_PIXELS]＝null（不縮）；否則等比、邊長 floor、至少 1。 */
+    internal fun budgetSize(w: Int, h: Int): Pair<Int, Int>? {
+        val n = w.toLong() * h
+        if (n <= MAX_PIXELS) return null
+        val s = sqrt(MAX_PIXELS.toDouble() / n)
+        return max(1, floor(w * s).toInt()) to max(1, floor(h * s).toInt())
+    }
+
+    /** [extraLines]（頁座標）→ 工作圖座標：兩軸都乘 [s]（＝工作圖寬 ÷ 頁寬）；[s] ＝ 1 原樣回傳。 */
+    internal fun scaleLines(lines: List<TextLine>, s: Float): List<TextLine> =
+        if (s == 1f) lines else lines.map { l -> TextLine(l.quad.map { Pt(it.x * s, it.y * s) }, l.score) }
+
     /**
-     * 引擎二值遮罩 Bitmap（0xFFFFFFFF／0xFF000000）→ nightread [Mask]。[Detector.detect] 回的是原圖尺寸，
-     * 但保留最近鄰放大這條後路（筆畫遮罩若哪天改回半解析度也不會默默錯位）。
+     * 遮罩 [mw]×[mh] 蓋不蓋得住頁 [pw]×[ph]：尺寸可以不同（降採樣解碼的取整、或給原尺寸的遮罩），長寬比要一致——交叉乘積差
+     * ≤ 2 ×（四個邊長和），約等於頁邊錯位 ≤ 2 px。超過＝不是這頁的遮罩（拿錯頁、轉了方向、雙頁跨頁）。
+     */
+    internal fun maskFitsPage(mw: Int, mh: Int, pw: Int, ph: Int): Boolean =
+        mw > 0 && mh > 0 && pw > 0 && ph > 0 &&
+            abs(mw.toLong() * ph - mh.toLong() * pw) <= 2L * (mw.toLong() + mh + pw + ph)
+
+    private fun requireFitsPage(mask: Bitmap, page: Bitmap) {
+        require(maskFitsPage(mask.width, mask.height, page.width, page.height)) {
+            "inpaintMask ${mask.width}×${mask.height} 與頁 ${page.width}×${page.height} 的長寬比對不上（不是這頁的去字遮罩？）"
+        }
+    }
+
+    /**
+     * 引擎二值遮罩 Bitmap（0xFFFFFFFF／0xFF000000，看藍通道 > 127）→ nightread [Mask]（w×h）：[resampleMask] 逐列讀，
+     * 不配整張 int 緩衝。[Detector.detect] 的 textMask 是原圖尺寸（逐像素照搬）；去字遮罩縮圖時跟頁一起縮（最近鄰）。
      */
     private fun maskFromBitmap(bmp: Bitmap, w: Int, h: Int): Mask {
-        val m = Mask(w, h)
         val bw = bmp.width
-        val bh = bmp.height
-        val px = IntArray(bw * bh)
-        bmp.getPixels(px, 0, bw, 0, 0, bw, bh)
-        if (bw == w && bh == h) {
-            for (i in px.indices) m.data[i] = (px[i] and 0xFF) > 127
-        } else {
-            val sx = bw.toDouble() / w
-            val sy = bh.toDouble() / h
-            for (y in 0 until h) {
-                val my = min(bh - 1, (y * sy).toInt())
-                for (x in 0 until w) {
-                    val mx = min(bw - 1, (x * sx).toInt())
-                    m.data[y * w + x] = (px[my * bw + mx] and 0xFF) > 127
-                }
+        return resampleMask(bw, bmp.height, w, h) { y, row -> bmp.getPixels(row, 0, bw, 0, y, bw, 1) }
+    }
+
+    /**
+     * 二值遮罩（[srcW]×[srcH] 的 ARGB，藍通道 > 127＝true）以最近鄰對應到 [w]×[h]，與 `cv2.resize(INTER_NEAREST)` 同式
+     * （[nearestIndex]；研究端把翻譯素材的去字遮罩縮到頁面尺寸就是這樣）。同尺寸＝逐像素照搬。[readRow] 把來源第 y 列
+     * （[srcW] 個 ARGB）填進給的緩衝；同一來源列只讀一次。
+     */
+    internal fun resampleMask(srcW: Int, srcH: Int, w: Int, h: Int, readRow: (y: Int, row: IntArray) -> Unit): Mask {
+        val m = Mask(w, h)
+        val xs = nearestIndex(srcW, w)
+        val ys = nearestIndex(srcH, h)
+        val row = IntArray(srcW)
+        var loaded = -1
+        for (y in 0 until h) {
+            val sy = ys[y]
+            if (sy != loaded) {
+                readRow(sy, row)
+                loaded = sy
             }
+            val o = y * w
+            for (x in 0 until w) m.data[o + x] = (row[xs[x]] and 0xFF) > 127
         }
         return m
+    }
+
+    /**
+     * 最近鄰的來源索引，照抄 OpenCV `resize` 的 INTER_NEAREST：`ifx = 1 / (dst / src)`，`src_i = min(floor(i × ifx), src − 1)`
+     * （不是 INTER_NEAREST_EXACT 的半像素中心）。同尺寸＝恆等。
+     */
+    internal fun nearestIndex(src: Int, dst: Int): IntArray {
+        val inv = 1.0 / (dst.toDouble() / src)
+        return IntArray(dst) { min(floor(it * inv).toInt(), src - 1) }
     }
 }
