@@ -7,8 +7,10 @@ import li.joye.yakuyomi.nightread.NightRead
 import li.joye.yakuyomi.nightread.NightReadDebug
 import li.joye.yakuyomi.nightread.NightReadInput
 import li.joye.yakuyomi.nightread.NightReadParams
+import li.joye.yakuyomi.nightread.NightReadStageTimer
 import li.joye.yakuyomi.nightread.NightTier
 import li.joye.yakuyomi.nightread.TextRegion as NrRegion
+import java.util.concurrent.Executor
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
@@ -102,6 +104,13 @@ class NightReadStats {
  * **併發**：可以多頁並行——這裡與 nightread 函式庫都沒有共享可變狀態（函式庫已驗可重入：多緒 render 與單緒逐像素相同）。
  * 記憶體由呼叫端控管（每頁約 150 MB，512 MB heap 約只放得下 2 頁）；推論進不進 NCNN 全域鎖、持鎖前向的優先權與中止由
  * 模型組決定（[NcnnFlavor]、[NcnnLowPriorityHook]）；呼叫端要在每次推論前後插自己的檢查點時用 lambda 版 [render]。
+ *
+ * **頁內並行**（各重繪入口的 `parallel`，2026-10-06）：nightread 分析裡彼此獨立的分支（人物收邊平滑、場景曲線、灰圈證據、
+ * 貼紙計畫）與「更多」的背景物件量測丟給這個 Executor 跑（`NightRead.renderTiers` 的同名參數；輸出逐位元相同）。**預設 null＝
+ * 依序**：開了每頁的 heap 尖峰多約 7 B/px（2.6 MPx 頁 +18–20 MB，58 B/px 的估算要跟著加），行程 CPU 多約一成，換單頁牆鐘
+ * 約 −22%（桌面 4 核）——多頁並行時核已經有人用、heap 預算也只夠兩頁，通常不划算；呼叫端在「這頁是唯一在飛的頁、核有空、
+ * heap 夠」時才給。分支還沒被池子開始跑時重繪執行緒自己跑（池子小或滿都不會乾等），所以池子可以多頁共用、大小自訂；
+ * 分支在池子的執行緒上跑，那些執行緒的優先權歸呼叫端管（例如讓路時給一個「直接在呼叫執行緒跑」的 Executor）。
  */
 object NightReadRenderer {
 
@@ -158,10 +167,11 @@ object NightReadRenderer {
         stats: NightReadStats? = null,
         extraLines: List<TextLine> = emptyList(),
         inpaintMask: Bitmap? = null,
+        parallel: Executor? = null,
     ): Bitmap = checkNotNull(
         render(
             page, detect = detector::detect, segment = charSeg::segment, params = params, stats = stats,
-            extraLines = extraLines, inpaintMask = inpaintMask,
+            extraLines = extraLines, inpaintMask = inpaintMask, parallel = parallel,
         ),
     )
 
@@ -173,6 +183,7 @@ object NightReadRenderer {
      *
      * [beforeRender]：推論做完、進入 Kotlin 重繪（一頁最貴的一段，數秒）之前呼叫一次。回 false＝放棄這頁 → 回 null，
      * finally 照樣回收 textMask 與縮圖（呼叫端用來在暫停／讓路時丟回待做、把 heap 放掉）。
+     * [parallel]：頁內並行（見類別說明；null＝依序）。
      */
     fun render(
         page: Bitmap,
@@ -183,8 +194,9 @@ object NightReadRenderer {
         extraLines: List<TextLine> = emptyList(),
         inpaintMask: Bitmap? = null,
         beforeRender: () -> Boolean = { true },
+        parallel: Executor? = null,
     ): Bitmap? = withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
-        render(work, detection, chars, params, stats, inpaintMask)
+        render(work, detection, chars, params, stats, inpaintMask, parallel)
     }
 
     /**
@@ -207,7 +219,7 @@ object NightReadRenderer {
      * 輸出尺寸＝實際跑的尺寸（縮過就是縮後尺寸，見 [NightReadStats.scaledTo]），各檔一定同尺寸。
      * [stats]：detect／mask 同 [render]；[NightReadStats.renderMs] 不含 sink；[NightReadStats.tierMs] 每檔；
      * [NightReadStats.stagesMs] 的分析段照舊、各檔的段名加檔位前綴（`l2.paintSticker=45`）。
-     * [inpaintMask] 同一條龍 [render]（只有「更多」看它）。
+     * [inpaintMask] 同一條龍 [render]（只有「更多」看它）。[parallel]：頁內並行（見類別說明；null＝依序）。
      *
      * 記憶體：桌面 JVM 量最低可跑 heap（SerialGC、固定 young），多檔版與單檔 [render] 相同（nightread 共用分析的快取存
      * 1 bit/px），所以每頁 58 B/px 的估算照用；帶 [inpaintMask] 的頁多 1 B/px（轉成的布林遮罩）＋函式庫內部位元版 1/8 B/px
@@ -223,11 +235,12 @@ object NightReadRenderer {
         inpaintMask: Bitmap? = null,
         beforeRender: () -> Boolean = { true },
         tiers: List<NightTier> = NightTier.entries,
+        parallel: Executor? = null,
         sink: (NightTier, Bitmap?) -> Unit,
     ): Boolean {
         require(tiers.isNotEmpty()) { "renderTiers：至少要一檔" }
         return withInference(page, detect, segment, stats, extraLines, inpaintMask, beforeRender) { work, detection, chars ->
-            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, sink)
+            renderTiersOn(work, detection, chars, base, tiers, stats, inpaintMask, parallel, sink)
         } != null
     }
 
@@ -241,10 +254,11 @@ object NightReadRenderer {
         extraLines: List<TextLine> = emptyList(),
         inpaintMask: Bitmap? = null,
         tiers: List<NightTier> = NightTier.entries,
+        parallel: Executor? = null,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         renderTiers(page, detect = detector::detect, segment = charSeg::segment, base = base, stats = stats,
-            extraLines = extraLines, inpaintMask = inpaintMask, tiers = tiers, sink = sink)
+            extraLines = extraLines, inpaintMask = inpaintMask, tiers = tiers, parallel = parallel, sink = sink)
     }
 
     /**
@@ -299,28 +313,31 @@ object NightReadRenderer {
         params: NightReadParams = NightReadParams(),
         stats: NightReadStats? = null,
         inpaintMask: Bitmap? = null,
+        parallel: Executor? = null,
     ): Bitmap {
         val t = System.nanoTime()
         inpaintMask?.let { requireFitsPage(it, page) }
         val px = IntArray(page.width * page.height)
         val input = toInput(page, detection, charMask, px, inpaintMask)
 
-        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；回呼只多做幾次遮罩計數（幾 ms），
-        // 輸出不變。沒傳 stats 就不掛回呼。
+        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；用只要段名的 NightReadStageTimer（函式庫不算遮罩
+        // 計數），輸出不變。沒傳 stats 就不掛回呼。頁內並行時段的時間是重繪執行緒自己的牆鐘（並行分支算在等它的那一段）。
         val marks = if (stats != null) StringBuilder() else null
         var last = System.nanoTime()
         val debug: NightReadDebug? = marks?.let { sb ->
-            { stage, _ ->
-                val now = System.nanoTime()
-                val d = (now - last) / 1_000_000
-                last = now
-                if (d >= NightReadStats.STAGE_MIN_MS) {
-                    if (sb.isNotEmpty()) sb.append(' ')
-                    sb.append(stage).append('=').append(d)
+            object : NightReadStageTimer {
+                override fun invoke(stage: String, value: Int) {
+                    val now = System.nanoTime()
+                    val d = (now - last) / 1_000_000
+                    last = now
+                    if (d >= NightReadStats.STAGE_MIN_MS) {
+                        if (sb.isNotEmpty()) sb.append(' ')
+                        sb.append(stage).append('=').append(d)
+                    }
                 }
             }
         }
-        val res = NightRead.render(input, params, debug)
+        val res = NightRead.render(input, params, debug, parallel)
         stats?.stagesMs = marks?.toString()
 
         // 輸出：Gray 0..255 → 不透明灰 ARGB；重用 px 當輸出緩衝（省一份 w×h int）
@@ -341,6 +358,7 @@ object NightReadRenderer {
         tiers: List<NightTier>,
         stats: NightReadStats?,
         inpaintMask: Bitmap?,
+        parallel: Executor?,
         sink: (NightTier, Bitmap?) -> Unit,
     ) {
         val t = System.nanoTime()
@@ -363,18 +381,21 @@ object NightReadRenderer {
                 marks.append(name).append('=').append(d)
             }
         }
-        val debug: NightReadDebug? = if (stats == null) null else { stage, value ->
-            val now = System.nanoTime()
-            if (stage == "tier") {
-                prefix = tiers[value].key + "."
-                mark(prefix + "keep", now)          // 上一檔交出後到這一檔開始：篩 keep（第一個用到 plain 的檔含 plain 判定）
-                tierStart = now
-            } else {
-                mark(prefix + stage, now)
+        // 只要段名（NightReadStageTimer：函式庫不算遮罩計數；"tier" 照送檔位索引）
+        val debug: NightReadDebug? = if (stats == null) null else object : NightReadStageTimer {
+            override fun invoke(stage: String, value: Int) {
+                val now = System.nanoTime()
+                if (stage == "tier") {
+                    prefix = tiers[value].key + "."
+                    mark(prefix + "keep", now)          // 上一檔交出後到這一檔開始：篩 keep（第一個用到 plain 的檔含 plain 判定）
+                    tierStart = now
+                } else {
+                    mark(prefix + stage, now)
+                }
             }
         }
 
-        streamTiers(input, tiers, base, px, debug) { k, emitted, composed ->
+        streamTiers(input, tiers, base, px, debug, parallel) { k, emitted, composed ->
             if (!emitted) {
                 val s0 = System.nanoTime()
                 if (composed) tierMs[k] = (s0 - tierStart) / 1_000_000
@@ -417,9 +438,10 @@ object NightReadRenderer {
         base: NightReadParams,
         px: IntArray,
         debug: NightReadDebug?,
+        parallel: Executor? = null,
         out: (k: Int, emitted: Boolean, composed: Boolean) -> Unit,
     ) {
-        NightRead.renderTiers(input, tiers.map { it.apply(base) }, debug) { k, gray ->
+        NightRead.renderTiers(input, tiers.map { it.apply(base) }, debug, parallel) { k, gray ->
             when {
                 gray == null -> out(k, false, false)
                 // 輸出去重：keep 不同、成品卻逐像素跟上一個交出的檔相同時也不交。第 0 檔一定非 null、一定寫進 px；

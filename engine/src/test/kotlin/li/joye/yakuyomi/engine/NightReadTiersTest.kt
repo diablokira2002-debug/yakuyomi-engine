@@ -12,6 +12,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import javax.imageio.ImageIO
 
 /**
@@ -60,11 +62,11 @@ class NightReadTiersTest {
     )
 
     /** 一次 streamTiers：每檔（依 [tiers] 順序）交出的灰階壓成 1 B/px；沒交圖＝null。也守回呼順序與 ARGB 不透明。 */
-    private fun run(page: String, inp: NightReadInput, tiers: List<NightTier>): List<ByteArray?> {
+    private fun run(page: String, inp: NightReadInput, tiers: List<NightTier>, parallel: Executor? = null): List<ByteArray?> {
         val px = IntArray(inp.gray.w * inp.gray.h)
         val order = ArrayList<Int>()
         val out = arrayOfNulls<ByteArray>(tiers.size)
-        NightReadRenderer.streamTiers(inp, tiers, NightReadParams(), px, debug = null) { k, emitted, _ ->
+        NightReadRenderer.streamTiers(inp, tiers, NightReadParams(), px, debug = null, parallel = parallel) { k, emitted, _ ->
             order += k
             if (emitted) {
                 assertTrue("$page/${tiers[k].key}：交出的 ARGB 要不透明灰", px.all { p -> (p ushr 24) == 0xFF })
@@ -108,6 +110,31 @@ class NightReadTiersTest {
      * 四頁 fixture（demo04 7.2 MPx 不跑，免測試 JVM OOM）。兩條分支都要走到：至少一頁 L3 ≠ L2（交圖）、至少一頁 L3 ＝ L2
      * （交 null）——哪頁走哪條隨函式庫演算法變（ch34_011 在 PEAK_MAX 800 後 L2＝L3），所以只要求各至少一頁。
      */
+    /**
+     * 頁內並行（parallel，2026-10-06）：產品兩檔交出的每一檔、交不交圖都與依序版逐位元相同（函式庫 ParallelRenderTest 守演算法本身，
+     * 這裡守引擎有把 Executor 接過去）。
+     */
+    @Test
+    fun parallelMatchesSequential() {
+        val pool = Executors.newFixedThreadPool(3)
+        try {
+            for (page in listOf("ch34_011", "demo06")) {
+                val inp = input(page)
+                val tiers = listOf(NightTier.L2, NightTier.L3)
+                val seq = run(page, inp, tiers)
+                val par = run(page, inp, tiers, pool)
+                for (k in tiers.indices) {
+                    val a = seq[k]
+                    val b = par[k]
+                    if (a == null || b == null) assertEquals("$page 第 $k 檔去重", a == null, b == null)
+                    else assertArrayEquals("$page 第 $k 檔並行＝依序", a, b)
+                }
+            }
+        } finally {
+            pool.shutdown()
+        }
+    }
+
     @Test
     fun twoTiersMatchThreeTierRun() {
         val emitted = listOf("ch34_011", "demo02", "demo05", "demo06").map(::checkPage)
