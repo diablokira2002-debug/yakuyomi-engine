@@ -107,10 +107,6 @@ class NightReadTiersTest {
     }
 
     /**
-     * 四頁 fixture（demo04 7.2 MPx 不跑，免測試 JVM OOM）。兩條分支都要走到：至少一頁 L3 ≠ L2（交圖）、至少一頁 L3 ＝ L2
-     * （交 null）——哪頁走哪條隨函式庫演算法變（ch34_011 在 PEAK_MAX 800 後 L2＝L3），所以只要求各至少一頁。
-     */
-    /**
      * 頁內並行（parallel，2026-10-06）：產品兩檔交出的每一檔、交不交圖都與依序版逐位元相同（函式庫 ParallelRenderTest 守演算法本身，
      * 這裡守引擎有把 Executor 接過去）。
      */
@@ -135,6 +131,10 @@ class NightReadTiersTest {
         }
     }
 
+    /**
+     * 四頁 fixture（demo04 7.2 MPx 不跑，免測試 JVM OOM）。兩條分支都要走到：至少一頁 L3 ≠ L2（交圖）、至少一頁 L3 ＝ L2
+     * （交 null）——哪頁走哪條隨函式庫演算法變（ch34_011 在 PEAK_MAX 800 後 L2＝L3），所以只要求各至少一頁。
+     */
     @Test
     fun twoTiersMatchThreeTierRun() {
         val emitted = listOf("ch34_011", "demo02", "demo05", "demo06").map(::checkPage)

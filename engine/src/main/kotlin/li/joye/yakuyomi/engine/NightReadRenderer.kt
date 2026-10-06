@@ -107,10 +107,11 @@ class NightReadStats {
  *
  * **頁內並行**（各重繪入口的 `parallel`，2026-10-06）：nightread 分析裡彼此獨立的分支（人物收邊平滑、場景曲線、灰圈證據、
  * 貼紙計畫）與「更多」的背景物件量測丟給這個 Executor 跑（`NightRead.renderTiers` 的同名參數；輸出逐位元相同）。**預設 null＝
- * 依序**：開了每頁的 heap 尖峰多約 5–9 B/px（2.6 MPx 頁 +12–24 MB，跟排程有關；58 B/px 的估算要加到約 67），行程 CPU 多約一成，換單頁牆鐘
- * 約 −22%（桌面 4 核）——多頁並行時核已經有人用、heap 預算也只夠兩頁，通常不划算；呼叫端在「這頁是唯一在飛的頁、核有空、
- * heap 夠」時才給。分支還沒被池子開始跑時重繪執行緒自己跑（池子小或滿都不會乾等），所以池子可以多頁共用、大小自訂；
- * 分支在池子的執行緒上跑，那些執行緒的優先權歸呼叫端管（例如讓路時給一個「直接在呼叫執行緒跑」的 Executor）。
+ * 依序**：開了每頁的 heap 尖峰多 11–27 MB（2.6 MPx 頁，最多約 10.4 B/px，跟排程有關；2026-10-07 審查另一套量法的上緣），
+ * 58 B/px 的估算要加到**至少 70**；行程 CPU 多約一成，換單頁牆鐘約 −22%（桌面 4 核）——多頁並行時核已經有人用、heap 預算也
+ * 只夠兩頁，通常不划算；呼叫端在「這頁是唯一在飛的頁、核有空、heap 夠」時才給。分支還沒被池子開始跑時重繪執行緒自己跑（池子
+ * 小或滿都不會乾等），所以池子可以多頁共用、大小自訂；分支在池子的執行緒上跑，那些執行緒的優先權歸呼叫端管（例如讓路時給一個
+ * 「直接在呼叫執行緒跑」的 Executor）。重繪執行緒等分支時被中斷照樣做完（與依序版一樣不理會中斷，旗標回傳前補回去）。
  */
 object NightReadRenderer {
 
@@ -320,8 +321,8 @@ object NightReadRenderer {
         val px = IntArray(page.width * page.height)
         val input = toInput(page, detection, charMask, px, inpaintMask)
 
-        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；用只要段名的 NightReadStageTimer（函式庫不算遮罩
-        // 計數），輸出不變。沒傳 stats 就不掛回呼。頁內並行時段的時間是重繪執行緒自己的牆鐘（並行分支算在等它的那一段）。
+        // 分段計時：借 nightread 的除錯回呼記「上一段到這一段」的毫秒數；用只要段名的 NightReadStageTimer（函式庫不另掃整頁算
+        // 遮罩計數，值只用段名），輸出不變。沒傳 stats 就不掛回呼。頁內並行時段的時間是重繪執行緒自己的牆鐘（並行分支算在等它的那一段）。
         val marks = if (stats != null) StringBuilder() else null
         var last = System.nanoTime()
         val debug: NightReadDebug? = marks?.let { sb ->
