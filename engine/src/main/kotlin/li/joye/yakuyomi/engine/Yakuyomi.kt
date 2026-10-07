@@ -43,18 +43,33 @@ object Yakuyomi {
     ): TranslationEngine {
         // 三顆模型（偵測／OCR／去字）全 NCNN（產品 arm64、NCNN 必在；ORT 已整個從引擎拔除、LaMa 退役）。
         check(NcnnBackend.available) { "NCNN 原生庫未載入（arm64 應可用）" }
-        EngineTrace.log("create.detector")
-        val detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
-        EngineTrace.log("create.ocr")
-        val ocr = Ocr(models.ocr, alphabet, config.ocr)
-        // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
-        EngineTrace.log("create.inpainter")
-        val inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)
-        // Local Arabic build: always create the on-device translator.
-        // apiKey is intentionally ignored so existing app call sites remain source-compatible.
-        val translator = LlmTranslator("", config.translator)
-        EngineTrace.log("create.done")
-        return Pipeline(detector, ocr, translator, inpainter, config, typeface)
+
+        var detector: Detector? = null
+        var ocr: Ocr? = null
+        var inpainter: Inpainter? = null
+        var translator: LlmTranslator? = null
+        try {
+            EngineTrace.log("create.detector")
+            detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
+            EngineTrace.log("create.ocr")
+            ocr = Ocr(models.ocr, alphabet, config.ocr)
+            // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
+            EngineTrace.log("create.inpainter")
+            inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)
+            // Local Arabic build: always create the on-device translator.
+            // apiKey is intentionally ignored so existing app call sites remain source-compatible.
+            EngineTrace.log("create.translator")
+            translator = LlmTranslator("", config.translator)
+            EngineTrace.log("create.done")
+            return Pipeline(detector, ocr, translator, inpainter, config, typeface)
+        } catch (t: Throwable) {
+            EngineTrace.log("create.fail ${t.javaClass.simpleName}: ${t.message}")
+            runCatching { translator?.closeLocalTranslator() }
+            runCatching { inpainter?.close() }
+            runCatching { ocr?.close() }
+            runCatching { detector?.close() }
+            throw t
+        }
     }
 
     /** 這顆 CPU 有 fp16 storage/arithmetic（arm82 asimdhp）——決定 OCR 能不能用混合精度 param（見 [Ocr]、[OcrConfig.ncnnMixed]）。 */
