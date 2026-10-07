@@ -32,6 +32,19 @@ data class DetectorConfig(
     val dbBinThreshold: Float = 0.5f,     // DB binarize：sigmoid(db ch0) > 此（m-i-t text_threshold=0.5）
     val dbBoxThreshold: Float = 0.7f,     // DB score 過濾：component-mean prob < 此丟（m-i-t box_threshold=0.7）
     val dbUnclipRatio: Float = 2.3f,      // DB unclip 膨脹（m-i-t unclip_ratio=2.3）
+
+    // Arabic V2 detector rescue pass. It reuses the SAME DBNet probability map (no second neural inference)
+    // with slightly softer thresholds, then keeps only small/high-confidence/non-duplicate boxes.
+    // This targets small speech text that sits just below the normal DBNet threshold without turning
+    // manga artwork into a flood of OCR candidates.
+    val rescueSmallText: Boolean = true,
+    val rescueBinThreshold: Float = 0.42f,
+    val rescueBoxThreshold: Float = 0.60f,
+    val rescueUnclipRatio: Float = 2.0f,
+    val rescueMaxShortSideRatio: Float = 0.12f,
+    val rescueMaxLongSideRatio: Float = 0.55f,
+    val rescueDuplicateIou: Float = 0.35f,
+    val rescueMaxExtraLines: Int = 24,
 )
 
 data class OcrConfig(
