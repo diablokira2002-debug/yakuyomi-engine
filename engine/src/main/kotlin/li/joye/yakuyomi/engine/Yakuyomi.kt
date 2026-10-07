@@ -29,7 +29,7 @@ object Yakuyomi {
      *
      * @param models   三顆模型的本機路徑（見 [ModelSet]；用 [ModelSet.resolve] 從檔名比對）。
      * @param alphabet OCR 字元表（48px CTC 解碼用；通常由引擎 assets 載入後傳入）。
-     * @param apiKey   翻譯 LLM 的 API key；**null/空白＝不翻譯**（只跑偵測/OCR/去字，純除錯）。
+     * @param apiKey   保留此參數僅為了相容既有呼叫端；本版本使用裝置端 English → Arabic 翻譯，不再需要 API key。
      * @param config   引擎設定（全可調，預設見各 `*Config`）。
      * @param typeface 算繪字型；null＝系統預設 CJK。
      * @return 可 `use { }` 的 [TranslationEngine]；其 [TranslationEngine.close] 會釋放三顆模型的 native session。
@@ -50,7 +50,9 @@ object Yakuyomi {
         // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
         EngineTrace.log("create.inpainter")
         val inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)
-        val translator = apiKey?.takeIf { it.isNotBlank() }?.let { LlmTranslator(it, config.translator) }
+        // Local Arabic build: always create the on-device translator.
+        // apiKey is intentionally ignored so existing app call sites remain source-compatible.
+        val translator = LlmTranslator("", config.translator)
         EngineTrace.log("create.done")
         return Pipeline(detector, ocr, translator, inpainter, config, typeface)
     }
