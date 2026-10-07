@@ -47,11 +47,18 @@ class LlmTranslator(
         val raw: String? = null,
     )
 
-    private val languageIdentifier = LanguageIdentification.getClient(
-        LanguageIdentificationOptions.Builder()
-            .setConfidenceThreshold(LANGUAGE_CONFIDENCE)
-            .build(),
-    )
+    // Delay ML Kit client creation until the first actual translation request.
+    // This keeps engine construction lightweight and, more importantly, ensures a
+    // ML Kit initialization problem is reported as a per-page translation failure
+    // instead of aborting construction after the large NCNN models are already loaded.
+    private val languageIdentifierDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        LanguageIdentification.getClient(
+            LanguageIdentificationOptions.Builder()
+                .setConfidenceThreshold(LANGUAGE_CONFIDENCE)
+                .build(),
+        )
+    }
+    private val languageIdentifier by languageIdentifierDelegate
 
     private val clients = LinkedHashMap<String, com.google.mlkit.nl.translate.Translator>()
     private val readyModels = HashSet<String>()
@@ -83,6 +90,7 @@ class LlmTranslator(
                 failed++
                 val message = "${t.javaClass.simpleName}: ${t.message}"
                 errors += message
+                EngineTrace.log("translate.error $message")
                 Log.w(TAG, "Local translation failed for one region: $message")
                 sourceRaw
             }
@@ -185,7 +193,9 @@ class LlmTranslator(
     }
 
     fun closeLocalTranslator() {
-        runCatching { languageIdentifier.close() }
+        if (languageIdentifierDelegate.isInitialized()) {
+            runCatching { languageIdentifier.close() }
+        }
         synchronized(clients) {
             clients.values.forEach { runCatching { it.close() } }
             clients.clear()
