@@ -5,6 +5,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextDirectionHeuristics
+import android.text.TextPaint
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.min
@@ -100,6 +104,16 @@ object Renderer {
     private fun isCjk(text: String): Boolean = text.any {
         val o = it.code
         o in 0x3040..0x30FF || o in 0x4E00..0x9FFF || o in 0x3400..0x4DBF || o in 0xFF00..0xFFEF
+    }
+
+    /** Arabic / Arabic Supplement / Presentation Forms. */
+    private fun isArabic(text: String): Boolean = text.any {
+        val o = it.code
+        o in 0x0600..0x06FF ||
+            o in 0x0750..0x077F ||
+            o in 0x08A0..0x08FF ||
+            o in 0xFB50..0xFDFF ||
+            o in 0xFE70..0xFEFF
     }
 
     /** 直排：欄右→左、格上→下、向上對齊；大小填滿放大後的文字框、每欄少 colTrim 格。每格＝1 字或 1 個縱中橫短串。 */
@@ -201,8 +215,24 @@ object Renderer {
         canvas.restore()
     }
 
-    /** 橫排：列上→下、字左→右、向上對齊；大小填滿放大後的文字框。 */
-    private fun drawHorizontal(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false) {
+    /** Horizontal renderer. Arabic uses Android's bidi/shaping engine; other scripts keep legacy wrapping. */
+    private fun drawHorizontal(
+        canvas: Canvas,
+        x0: Float,
+        y0: Float,
+        x1: Float,
+        y1: Float,
+        text: String,
+        fill: Paint,
+        stroke: Paint,
+        cfg: RenderConfig,
+        onArt: Boolean = false,
+    ) {
+        if (isArabic(text)) {
+            drawArabicHorizontal(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, onArt)
+            return
+        }
+
         val bw = (x1 - x0) * cfg.expandW
         val rowRoom = (y1 - y0) * cfg.expandH
         var size = cfg.fontSizeMin
@@ -210,18 +240,24 @@ object Renderer {
         var s = min(rowRoom.toInt(), cfg.fontSizeMax)
         while (s >= cfg.fontSizeMin) {
             fill.textSize = s.toFloat()
-            val ls = wrapCjk(text, fill, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat())) // 每行少 rowTrim 字（橫向字數）
+            val ls = wrapCjk(text, fill, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat()))
             val maxW = ls.maxOfOrNull { fill.measureText(it) } ?: 0f
-            if (ls.size * s * 1.18f <= rowRoom && maxW <= bw) { size = s; lines = ls; break }
+            if (ls.size * s * 1.18f <= rowRoom && maxW <= bw) {
+                size = s
+                lines = ls
+                break
+            }
             s--
         }
-        size = maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // 整體縮小、更 fit
-        fill.textSize = size.toFloat(); stroke.textSize = size.toFloat()
-        stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))  // 描邊隨字級；壓畫面區用更粗白邊
-        lines = wrapCjk(text, fill, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()))  // 縮小後重排（含 rowTrim）
+
+        size = maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())
+        fill.textSize = size.toFloat()
+        stroke.textSize = size.toFloat()
+        stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))
+        lines = wrapCjk(text, fill, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()))
         val lh = size * 1.18f
         val tcx = (x0 + x1) / 2f
-        var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT  // 垂直置中於框
+        var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT
         for (ln in lines) {
             val tx = tcx - fill.measureText(ln) / 2f
             if (cfg.fontBorder) canvas.drawText(ln, tx, baseline, stroke)
@@ -229,6 +265,109 @@ object Renderer {
             baseline += lh
         }
     }
+
+    /**
+     * Professional Arabic typesetting:
+     * - Android StaticLayout performs Arabic shaping and bidi correctly.
+     * - Center aligned inside the detected speech region.
+     * - Finds the largest font size that fits both width and height.
+     * - Draws an outline pass first, then the fill pass.
+     * - Keeps Arabic words intact instead of splitting character-by-character.
+     */
+    private fun drawArabicHorizontal(
+        canvas: Canvas,
+        x0: Float,
+        y0: Float,
+        x1: Float,
+        y1: Float,
+        rawText: String,
+        fill: Paint,
+        stroke: Paint,
+        cfg: RenderConfig,
+        onArt: Boolean,
+    ) {
+        val text = normalizeArabicText(rawText)
+        if (text.isBlank()) return
+
+        val centerX = (x0 + x1) / 2f
+        val centerY = (y0 + y1) / 2f
+
+        val maxWidth = ((x1 - x0) * cfg.expandW)
+            .roundToInt()
+            .coerceAtLeast(1)
+        val maxHeight = ((y1 - y0) * cfg.expandH)
+            .roundToInt()
+            .coerceAtLeast(1)
+
+        val fillPaint = TextPaint(fill)
+        val strokePaint = TextPaint(stroke)
+
+        var chosenSize = cfg.fontSizeMin
+        var chosenLayout: StaticLayout? = null
+
+        var s = min(maxHeight, cfg.fontSizeMax)
+        while (s >= cfg.fontSizeMin) {
+            fillPaint.textSize = s.toFloat()
+            val candidate = buildArabicLayout(text, fillPaint, maxWidth)
+            if (candidate.height <= maxHeight) {
+                chosenSize = s
+                chosenLayout = candidate
+                break
+            }
+            s--
+        }
+
+        chosenSize = maxOf(cfg.fontSizeMin, (chosenSize * cfg.fontScale).roundToInt())
+        fillPaint.textSize = chosenSize.toFloat()
+
+        // Rebuild after fontScale, because line wrapping can change with size.
+        val fillLayout = buildArabicLayout(text, fillPaint, maxWidth)
+        strokePaint.textSize = chosenSize.toFloat()
+        strokePaint.style = Paint.Style.STROKE
+        strokePaint.strokeWidth = maxOf(
+            2f,
+            chosenSize * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO),
+        )
+        strokePaint.color = stroke.color
+
+        val strokeLayout = if (cfg.fontBorder) {
+            buildArabicLayout(text, strokePaint, maxWidth)
+        } else {
+            null
+        }
+
+        val blockHeight = fillLayout.height.toFloat()
+        val left = centerX - maxWidth / 2f
+        val top = centerY - blockHeight / 2f
+
+        canvas.save()
+        canvas.translate(left, top)
+        strokeLayout?.draw(canvas)
+        fillLayout.draw(canvas)
+        canvas.restore()
+    }
+
+    private fun buildArabicLayout(text: String, paint: TextPaint, width: Int): StaticLayout =
+        StaticLayout.Builder
+            .obtain(text, 0, text.length, paint, width)
+            .setAlignment(Layout.Alignment.ALIGN_CENTER)
+            .setTextDirection(TextDirectionHeuristics.RTL)
+            .setIncludePad(false)
+            .setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY)
+            .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
+            .setLineSpacing(0f, 1.02f)
+            .build()
+
+    /**
+     * Preserve Arabic punctuation/digits while cleaning spacing that often comes from OCR/translation.
+     * StaticLayout/Minikin performs the actual Arabic shaping; no manual glyph reversal is used.
+     */
+    private fun normalizeArabicText(value: String): String =
+        value
+            .replace('\u00A0', ' ')
+            .replace(Regex("""[ \t]+"""), " ")
+            .replace(Regex(""" *\n *"""), "\n")
+            .trim()
 
     private fun drawCharVertical(canvas: Canvas, ch: Char, cx: Float, cyc: Float, fill: Paint, stroke: Paint, border: Boolean) {
         val s = ch.toString()
