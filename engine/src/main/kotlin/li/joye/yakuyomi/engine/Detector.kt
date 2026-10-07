@@ -59,9 +59,19 @@ class Detector(
         // db ch0 = raw logits → sigmoid → prob（ctd 的 out0 已 sigmoid、DBNet 沒有）；網格＝矩形 inW×inH
         val prob = FloatArray(area)
         for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
-        val lines = linesFromProbMap(
+        val primaryLines = linesFromProbMap(
             cfg, prob, inW, inH, pre.ratio, page.width, page.height,
             cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
+        )
+        val lines = addSmallTextRescue(
+            cfg = cfg,
+            primary = primaryLines,
+            prob = prob,
+            gridW = inW,
+            gridH = inH,
+            ratio = pre.ratio,
+            origW = page.width,
+            origH = page.height,
         )
         // mask（已 sigmoid）→ 原圖尺寸筆畫遮罩。mask 空間 ratio = pre.ratio × mw/inW（半解析=ratio/2、全解析=ratio，動態）。
         val textMask = segToMask(cfg, mask, mw, mh, pre.ratio * mw.toFloat() / inW, page.width, page.height)
@@ -138,9 +148,19 @@ class Detector(
             val area = input.w * input.h
             val prob = FloatArray(area)
             for (i in 0 until area) prob[i] = 1f / (1f + exp(-db[i]))
-            val lines = linesFromProbMap(
+            val primaryLines = linesFromProbMap(
                 cfg, prob, input.w, input.h, input.ratio, pageW, pageH,
                 cfg.dbBinThreshold, cfg.dbBoxThreshold, cfg.dbUnclipRatio,
+            )
+            val lines = addSmallTextRescue(
+                cfg = cfg,
+                primary = primaryLines,
+                prob = prob,
+                gridW = input.w,
+                gridH = input.h,
+                ratio = input.ratio,
+                origW = pageW,
+                origH = pageH,
             )
             val textMask = segToMask(
                 cfg, mask, mw, mh, input.ratio * mw.toFloat() / input.w, pageW, pageH,
@@ -182,6 +202,98 @@ class Detector(
             small.recycle()
             for (i in px.indices) px[i] = if ((px[i] and 0xFF) > th) MASK_ON else MASK_OFF
             return Bitmap.createBitmap(px, origW, origH, Bitmap.Config.ARGB_8888)
+        }
+
+        /**
+         * Arabic V2 small-text rescue:
+         * - reuses the already computed DBNet probability map (zero extra model inference),
+         * - lowers thresholds only for the second candidate pass,
+         * - accepts only geometrically small boxes,
+         * - removes candidates that substantially overlap a normal detection,
+         * - caps extras per page so artwork/SFX cannot explode OCR work.
+         */
+        private fun addSmallTextRescue(
+            cfg: DetectorConfig,
+            primary: List<TextLine>,
+            prob: FloatArray,
+            gridW: Int,
+            gridH: Int,
+            ratio: Float,
+            origW: Int,
+            origH: Int,
+        ): List<TextLine> {
+            if (!cfg.rescueSmallText || cfg.rescueMaxExtraLines <= 0) return primary
+
+            val relaxed = linesFromProbMap(
+                cfg = cfg,
+                prob = prob,
+                gridW = gridW,
+                gridH = gridH,
+                ratio = ratio,
+                origW = origW,
+                origH = origH,
+                binThresh = cfg.rescueBinThreshold,
+                scoreThresh = cfg.rescueBoxThreshold,
+                unclip = cfg.rescueUnclipRatio,
+            )
+
+            if (relaxed.isEmpty()) return primary
+
+            val pageShort = min(origW, origH).toFloat().coerceAtLeast(1f)
+            val pageLong = maxOf(origW, origH).toFloat().coerceAtLeast(1f)
+
+            val extras = relaxed
+                .asSequence()
+                .filter { candidate ->
+                    val b = aabb(candidate.quad)
+                    val shortSide = min(b[2], b[3])
+                    val longSide = maxOf(b[2], b[3])
+                    shortSide <= pageShort * cfg.rescueMaxShortSideRatio &&
+                        longSide <= pageLong * cfg.rescueMaxLongSideRatio
+                }
+                .filter { candidate ->
+                    primary.none { existing ->
+                        bboxIou(candidate.quad, existing.quad) >= cfg.rescueDuplicateIou
+                    }
+                }
+                .sortedByDescending { it.score }
+                .take(cfg.rescueMaxExtraLines)
+                .toList()
+
+            if (extras.isNotEmpty()) {
+                EngineTrace.log("detect.rescue primary=${primary.size} extra=${extras.size}")
+                Log.i(TAG, "DBNet rescue +${extras.size} small-text lines")
+            }
+            return if (extras.isEmpty()) primary else primary + extras
+        }
+
+        private fun aabb(quad: List<Pt>): FloatArray {
+            val minX = quad.minOf { it.x }
+            val minY = quad.minOf { it.y }
+            val maxX = quad.maxOf { it.x }
+            val maxY = quad.maxOf { it.y }
+            return floatArrayOf(minX, minY, maxX - minX, maxY - minY)
+        }
+
+        private fun bboxIou(a: List<Pt>, b: List<Pt>): Float {
+            val aa = aabb(a)
+            val bb = aabb(b)
+            val ax2 = aa[0] + aa[2]
+            val ay2 = aa[1] + aa[3]
+            val bx2 = bb[0] + bb[2]
+            val by2 = bb[1] + bb[3]
+
+            val ix1 = maxOf(aa[0], bb[0])
+            val iy1 = maxOf(aa[1], bb[1])
+            val ix2 = min(ax2, bx2)
+            val iy2 = min(ay2, by2)
+            val iw = (ix2 - ix1).coerceAtLeast(0f)
+            val ih = (iy2 - iy1).coerceAtLeast(0f)
+            val inter = iw * ih
+            if (inter <= 0f) return 0f
+
+            val union = aa[2] * aa[3] + bb[2] * bb[3] - inter
+            return if (union <= 0f) 0f else inter / union
         }
 
         private fun linesFromProbMap(
