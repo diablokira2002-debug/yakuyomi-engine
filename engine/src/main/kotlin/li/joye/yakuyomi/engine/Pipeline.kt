@@ -70,6 +70,8 @@ class Pipeline(
     private val typeface: Typeface? = null,
 ) : TranslationEngine {
 
+    private val latinOcrRescue = LatinOcrRescue()
+
     override suspend fun translatePage(page: Bitmap): PageResult = coroutineScope {
         val tWall = System.currentTimeMillis()
         EngineTrace.log("pipe.page.enter ${page.width}x${page.height}")
@@ -80,22 +82,36 @@ class Pipeline(
         } catch (t: Throwable) {
             Log.e(TAG, "偵測失敗", t); return@coroutineScope PageResult.Failed("detect: ${t.message}")
         }
-        val lines = detection.lines
+        var lines = detection.lines
         EngineTrace.log("pipe.detect.done lines=${lines.size}")
         val detectMs = System.currentTimeMillis() - tDet
-        if (lines.isEmpty()) {
-            return@coroutineScope PageResult.Skipped("偵測不到文字", PageStats(0, 0, 0, detectMs, 0, 0, 0, 0))
+
+        // OCR + Latin rescue + grouping.
+        // Even when DBNet finds zero lines, ML Kit Latin OCR gets one chance to recover English dialogue.
+        val tOcr = System.currentTimeMillis()
+        if (lines.isNotEmpty()) {
+            EngineTrace.log("pipe.ocr.enter lines=${lines.size}")
+            try {
+                ocr.recognize(page, lines)
+            } catch (t: Throwable) {
+                Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
+            }
+            EngineTrace.log("pipe.ocr.exit")
         }
 
-        // OCR + 分群
-        val tOcr = System.currentTimeMillis()
-        EngineTrace.log("pipe.ocr.enter lines=${lines.size}")
-        try {
-            ocr.recognize(page, lines)
-        } catch (t: Throwable) {
-            Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
+        EngineTrace.log("pipe.ocr.latin.enter primary=${lines.size}")
+        val latin = latinOcrRescue.rescue(page, lines)
+        lines = latin.lines
+        val effectiveMask = latin.augmentMask(detection.textMask)
+        if (effectiveMask !== detection.textMask) {
+            detection.textMask.recycle()
         }
-        EngineTrace.log("pipe.ocr.exit")
+        EngineTrace.log("pipe.ocr.latin.exit lines=${lines.size}")
+
+        if (lines.isEmpty()) {
+            return@coroutineScope PageResult.Skipped("偵測不到文字", PageStats(0, 0, 0, detectMs, System.currentTimeMillis() - tOcr, 0, 0, 0))
+        }
+
         val regions = Grouping.group(lines)
         val ocrMs = System.currentTimeMillis() - tOcr
         // Arabic V2: only obvious, useful OCR text is sent to translation.
@@ -179,7 +195,7 @@ class Pipeline(
         EngineTrace.log("pipe.inpaint.enter regions=${renderRegions.size}")
         val cleaned = try {
             val t0 = System.currentTimeMillis()
-            val result = inpainter.inpaint(page, renderRegions, detection.textMask)
+            val result = inpainter.inpaint(page, renderRegions, effectiveMask)
             inpaintMs = System.currentTimeMillis() - t0
             EngineTrace.log("pipe.inpaint.exit")
             result
@@ -201,7 +217,7 @@ class Pipeline(
                 lines.size, regions.size, kept.size, detectMs, ocrMs, translateMs, inpaintMs, renderMs,
                 System.currentTimeMillis() - tWall, promptTok, completionTok,
             ),
-            PageAnalysis(detection.textMask, renderRegions),
+            PageAnalysis(effectiveMask, renderRegions),
         )
     }
 
@@ -222,6 +238,7 @@ class Pipeline(
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
         runCatching { (translator as? LlmTranslator)?.closeLocalTranslator() }
+        runCatching { latinOcrRescue.close() }
         runCatching { detector.close() }
         runCatching { ocr.close() }
         runCatching { inpainter.close() }
