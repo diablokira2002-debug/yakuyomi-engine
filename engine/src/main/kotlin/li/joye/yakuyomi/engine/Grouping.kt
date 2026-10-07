@@ -45,8 +45,44 @@ class TextRegion(
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 
-    /** 合併原文（lines 已依閱讀序排好）。日文無空白，直接相接。 */
-    val sourceText: String get() = lines.joinToString("") { it.text }
+    /**
+     * 合併原文（lines 已依閱讀序排好）。
+     *
+     * CJK（中/日）跨行通常不需要補空格；英文等以空格分詞的橫排語言若直接把 OCR 行串起來，
+     * 會變成 `THE COLORSARE ALL...`，既降低 Language ID 可信度，也讓翻譯品質變差。
+     * 因此 Arabic V2 對「橫排且以拉丁/韓文為主」的區域在行間補一個空格，再做基本空白清理。
+     */
+    val sourceText: String
+        get() {
+            val nonBlank = lines.map { it.text.trim() }.filter { it.isNotEmpty() }
+            if (nonBlank.isEmpty()) return ""
+            if (nonBlank.size == 1) return normalizeJoined(nonBlank[0])
+
+            val sample = nonBlank.joinToString("")
+            val separator = if (direction == "h" && prefersWordSpacing(sample)) " " else ""
+            return normalizeJoined(nonBlank.joinToString(separator))
+        }
+
+    private fun prefersWordSpacing(text: String): Boolean {
+        var spacedScript = 0
+        var cjk = 0
+        for (ch in text) {
+            val cp = ch.code
+            when {
+                ch in 'A'..'Z' || ch in 'a'..'z' || ch.isDigit() -> spacedScript++
+                cp in 0xAC00..0xD7AF -> spacedScript++ // Korean Hangul uses word spacing.
+                cp in 0x3040..0x30FF || cp in 0x3400..0x4DBF || cp in 0x4E00..0x9FFF -> cjk++
+            }
+        }
+        return spacedScript > cjk
+    }
+
+    private fun normalizeJoined(value: String): String =
+        value
+            .replace('\u00A0', ' ')
+            .replace(Regex("""[ \\t]+"""), " ")
+            .replace(Regex(""" +([,.;:!?،؛؟])"""), "$1")
+            .trim()
 
     val x0: Float = lines.minOf { ln -> ln.quad.minOf { it.x } }
     val y0: Float = lines.minOf { ln -> ln.quad.minOf { it.y } }
