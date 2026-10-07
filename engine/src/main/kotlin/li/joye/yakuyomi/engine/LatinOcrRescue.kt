@@ -63,21 +63,14 @@ internal class LatinOcrRescue : AutoCloseable {
     private val recognizer by recognizerDelegate
 
     suspend fun rescue(page: Bitmap, primary: List<TextLine>): LatinOcrResult {
-        val mlText = try {
-            recognizer.process(InputImage.fromBitmap(page, 0)).awaitText()
+        // Webtoon pages often have very narrow, tiny text. A single full-page ML Kit
+        // request misses bubbles on these images. Run overlapping, upscaled tiles and
+        // map their boxes back to ORIGINAL page coordinates before any inpainting.
+        val candidates = try {
+            recognizeCandidates(page)
         } catch (t: Throwable) {
             EngineTrace.log("ocr.latin.error ${t.javaClass.simpleName}: ${t.message}")
             return LatinOcrResult(primary, emptyList())
-        }
-
-        val candidates = mlText.textBlocks.mapNotNull { block ->
-            val rect = block.boundingBox ?: return@mapNotNull null
-            val text = normalize(block.text)
-            if (!isUsefulLatin(text) || isLikelyWatermark(text)) return@mapNotNull null
-            if (rect.width() < 8 || rect.height() < 8) return@mapNotNull null
-
-            val lineRects = block.lines.mapNotNull { it.boundingBox }.filter { it.width() >= 4 && it.height() >= 4 }
-            Candidate(text, Rect(rect), lineRects)
         }
 
         if (candidates.isEmpty()) {
@@ -141,6 +134,98 @@ internal class LatinOcrRescue : AutoCloseable {
                 "primary=${primary.size}->${out.size}",
         )
         return LatinOcrResult(out, maskRects)
+    }
+
+    private suspend fun recognizeCandidates(page: Bitmap): List<Candidate> {
+        val raw = mutableListOf<Candidate>()
+        try {
+            val full = recognizer.process(InputImage.fromBitmap(page, 0)).awaitText()
+            raw += parseCandidates(full, 0, 1f, page.width, page.height)
+        } catch (t: Throwable) {
+            EngineTrace.log("ocr.latin.full.error ${t.javaClass.simpleName}: ${t.message}")
+        }
+
+        // Small-width webtoon screenshots (about 300px) particularly benefit from
+        // 2x enlargement. Large regular manga pages use their original-resolution scan.
+        if (page.width < 900 && page.height > 700) {
+            val scale = if (page.width < 450) 2f else 1.5f
+            val tileHeight = (1000f / scale).toInt().coerceAtLeast(360)
+            val step = (tileHeight * 0.76f).toInt().coerceAtLeast(1)
+            var top = 0
+            while (top < page.height) {
+                val bottom = (top + tileHeight).coerceAtMost(page.height)
+                val tile = Bitmap.createBitmap(page, 0, top, page.width, bottom - top)
+                val scaled = Bitmap.createScaledBitmap(
+                    tile,
+                    (tile.width * scale).toInt(),
+                    (tile.height * scale).toInt(),
+                    true,
+                )
+                try {
+                    val result = recognizer.process(InputImage.fromBitmap(scaled, 0)).awaitText()
+                    raw += parseCandidates(result, top, scale, page.width, page.height)
+                } catch (t: Throwable) {
+                    EngineTrace.log("ocr.latin.tile.error top=$top ${t.javaClass.simpleName}: ${t.message}")
+                } finally {
+                    scaled.recycle()
+                    tile.recycle()
+                }
+                if (bottom == page.height) break
+                top += step
+            }
+        }
+
+        // The same bubble can appear in the full-page result and overlapping tiles.
+        // Preserve the longest recognized text and only one removal mask per bubble.
+        val deduplicated = mutableListOf<Candidate>()
+        for (candidate in raw.sortedByDescending { it.text.length }) {
+            val duplicate = deduplicated.any { prior ->
+                val overlap = rectOverlap(candidate.rect, prior.rect)
+                overlap >= 0.70f &&
+                    (
+                        candidate.text.equals(prior.text, ignoreCase = true) ||
+                            candidate.text.contains(prior.text, ignoreCase = true) ||
+                            prior.text.contains(candidate.text, ignoreCase = true) ||
+                            overlap >= 0.92f
+                        )
+            }
+            if (!duplicate) deduplicated += candidate
+        }
+        EngineTrace.log("ocr.latin.scan raw=${raw.size} unique=${deduplicated.size}")
+        return deduplicated.sortedWith(compareBy({ it.rect.top }, { it.rect.left }))
+    }
+
+    private fun parseCandidates(
+        output: Text,
+        tileTop: Int,
+        scale: Float,
+        width: Int,
+        height: Int,
+    ): List<Candidate> {
+        fun original(r: Rect): Rect = Rect(
+            (r.left / scale).toInt().coerceIn(0, width),
+            (tileTop + r.top / scale).toInt().coerceIn(0, height),
+            (r.right / scale).toInt().coerceIn(0, width),
+            (tileTop + r.bottom / scale).toInt().coerceIn(0, height),
+        )
+
+        return output.textBlocks.mapNotNull { block ->
+            val rect = block.boundingBox?.let(::original) ?: return@mapNotNull null
+            val text = normalize(block.text)
+            if (!isUsefulLatin(text) || isLikelyWatermark(text)) return@mapNotNull null
+            if (rect.width() < 6 || rect.height() < 5) return@mapNotNull null
+            val lineRects = block.lines.mapNotNull { it.boundingBox?.let(::original) }
+                .filter { it.width() >= 3 && it.height() >= 3 }
+            Candidate(text, rect, lineRects)
+        }
+    }
+
+    private fun rectOverlap(a: Rect, b: Rect): Float {
+        val w = (minOf(a.right, b.right) - maxOf(a.left, b.left)).coerceAtLeast(0)
+        val h = (minOf(a.bottom, b.bottom) - maxOf(a.top, b.top)).coerceAtLeast(0)
+        val area = w.toLong() * h
+        val smaller = minOf(a.width().toLong() * a.height(), b.width().toLong() * b.height())
+        return if (smaller <= 0) 0f else area.toFloat() / smaller
     }
 
     override fun close() {
