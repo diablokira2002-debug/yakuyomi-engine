@@ -163,6 +163,13 @@ class Pipeline(
             textRegions.forEach { it.translatedText = it.sourceText }
         }
 
+        // Never erase/redraw a partially translated page: retry the entire original page.
+        // An error includes a single failed bubble, not just total translation failure.
+        if (llmError != null) {
+            EngineTrace.log("pipe.translate.failed $llmError")
+            return@coroutineScope PageResult.Failed("Local translation incomplete: $llmError")
+        }
+
         // 判定每區譯文有效性（空白/數字/regex/譯==原＝失敗）。整頁全失敗 → 留原圖（Skipped、丟棄去字）。
         val kept = if (translator != null) TextFilter.apply(textRegions, cfg.translator.filterText) else textRegions
         if (kept.isEmpty()) {
