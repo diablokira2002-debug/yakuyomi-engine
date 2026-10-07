@@ -76,9 +76,9 @@ data class OcrConfig(
 
 // 預設 few-shot（日→繁中）：示範 <|i|> 逐行格式。改語言對時連同 toLangName/fromLangName 一起換成對應譯文。
 private const val DEFAULT_SAMPLE_SOURCE =
-    "<|1|>恥ずかしい… 目立ちたくない… 私が消えたい…\n<|2|>きみ… 大丈夫⁉\n<|3|>なんだこいつ 空気読めて ないのか…？"
+    "<|1|>I don\'t want anyone to notice me… I want to disappear…\n<|2|>Are you okay?\n<|3|>Can\'t this guy read the room?"
 private const val DEFAULT_SAMPLE_TARGET =
-    "<|1|>好尷尬…我不想引人注目…我想消失…\n<|2|>你…沒事吧⁉\n<|3|>這傢伙是看不懂氣氛嗎…？"
+    "<|1|>لا أريد أن يلاحظني أحد… أريد أن أختفي…\n<|2|>هل أنت بخير؟\n<|3|>ألا يستطيع هذا الشخص فهم الموقف؟"
 
 /**
  * 翻譯設定。**語言對可任意**（不寫死日→繁中，只是預設）：
@@ -89,15 +89,15 @@ private const val DEFAULT_SAMPLE_TARGET =
  */
 data class TranslatorConfig(
     val provider: String = "deepseek",                                  // 〔設定〕config.translator
-    val targetLang: String = "CHT",                                     // 〔設定〕config.target_lang
+    val targetLang: String = "AR",                                     // 〔設定〕config.target_lang
     // 預設同 LlmProviders 的 deepseek 那筆。舊名 deepseek-chat 於 2026-07-24 15:59 UTC 退役（送出去會 400）
     // → 改為其對應的 deepseek-v4-flash；存著舊名的既有設定由 LlmProviders.migrateModel 就地換名。
     val model: String = "deepseek-v4-flash",                            // 〔設定〕
     val apiBase: String = "https://api.deepseek.com/chat/completions",  // 〔設定〕custom_openai 用
     // ⚠️ toLangName / fromLangName 預設被 fork :domain 的 TranslationPreferences.DEFAULT_TARGET_LANG /
     //   DEFAULT_SOURCE_LANG 鏡像（:domain 不能 import 引擎）。改這兩個請同步改那邊，否則 few-shot 判斷會 drift。
-    val toLangName: String = "Traditional Chinese (Taiwan, 台灣慣用的繁體中文用語)",  // 〔設定〕目標語言
-    val fromLangName: String = "Japanese",          // 〔設定〕來源語言標註（空白＝讓 LLM 自己判）
+    val toLangName: String = "Arabic",  // 〔設定〕目標語言
+    val fromLangName: String = "English",          // 〔設定〕來源語言標註（空白＝讓 LLM 自己判）
     val sampleSource: String = DEFAULT_SAMPLE_SOURCE, // 〔設定〕few-shot 原文（空白＝不放範例）
     val sampleTarget: String = DEFAULT_SAMPLE_TARGET, // 〔設定〕few-shot 譯文（要跟 toLangName 同語言）
     // 〔設定〕**取樣溫度**。★不是每家/每個模型都吃：OpenAI 的 reasoning 模型（o 系列、gpt-5 系列）**拒收**
@@ -134,7 +134,7 @@ data class InpainterConfig(
 )
 
 data class RenderConfig(
-    val orientation: TextOrientation = TextOrientation.AUTO, // 〔設定〕對應 config.render.direction=auto（CJK→直排）
+    val orientation: TextOrientation = TextOrientation.HORIZONTAL, // 〔設定〕對應 config.render.direction=auto（CJK→直排）
     val fontBorder: Boolean = true,                              // 〔設定〕config.render.disable_font_border=false
     val artStrokeRatio: Float = 0.16f,                           // 壓畫面區(aot 重建·onArt)的白邊寬＝字級×此（比一般 0.10 粗；busy 背景上黑字粗白邊更好讀）
     val fontSizeMax: Int = 60,
