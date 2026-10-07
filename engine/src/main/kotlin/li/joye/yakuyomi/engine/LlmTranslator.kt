@@ -102,11 +102,13 @@ class LlmTranslator(
             }
         }
 
-        val error = when {
-            failed == 0 -> null
-            failed >= queries.count { it.isNotBlank() } ->
-                "Local translation failed for all non-empty regions: ${errors.distinct().joinToString(" | ")}"
-            else -> null // partial failures fall back to OCR text; successful bubbles are still useful
+        // A partially failed page must NOT be committed as successfully translated.
+        // Pipeline checks this error and keeps the original page for a later retry.
+        val error = if (failed == 0) {
+            null
+        } else {
+            "Local translation failed in $failed of ${queries.count { it.isNotBlank() }} regions: " +
+                errors.distinct().joinToString(" | ")
         }
 
         return TranslateResult(
@@ -125,8 +127,20 @@ class LlmTranslator(
     }
 
     private suspend fun translateOne(source: String): String {
-        val detectedTag = languageIdentifier.identifyLanguage(source).awaitString()
-        val sourceLanguage = resolveSourceLanguage(detectedTag, source)
+        // Short English manga dialogue ("NO!", "I'M FINE.") is frequently classified
+        // as another Latin language. Preserve English -> Arabic deterministically for
+        // Latin-only speech, while leaving Japanese/Chinese/Korean to language ID.
+        val hasCjk = source.any {
+            it.code in 0x3040..0x30FF || it.code in 0x3400..0x9FFF || it.code in 0xAC00..0xD7AF
+        }
+        val latinOnly = !hasCjk && source.any { it in 'A'..'Z' || it in 'a'..'z' } &&
+            source.none { it.isLetter() && it !in 'A'..'Z' && it !in 'a'..'z' }
+        val sourceLanguage = if (latinOnly) {
+            TranslateLanguage.ENGLISH
+        } else {
+            val detectedTag = languageIdentifier.identifyLanguage(source).awaitString()
+            resolveSourceLanguage(detectedTag, source)
+        }
 
         // The page is already Arabic: keep it unchanged and avoid a pointless model download.
         if (sourceLanguage == TranslateLanguage.ARABIC) return source
