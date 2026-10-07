@@ -23,8 +23,10 @@ import kotlin.math.max
  *  - replace obviously broken Latin OCR on an already-detected text line, and
  *  - recover a horizontal Latin line that DBNet/NCNN OCR missed entirely.
  *
- * Added lines carry a tight rectangular rescue mask so the original Latin text can be removed
- * before Arabic is rendered. URL/watermark-like text is intentionally ignored.
+ * ML Kit-matched/recovered Latin lines carry a tight rectangular rescue mask so the complete
+ * original Latin text can be removed before Arabic is rendered. URL/watermark-like text is
+ * intentionally ignored, and new DBNet-missed lines are accepted only on fairly uniform
+ * bubble-like backgrounds to avoid translating site watermarks drawn over artwork.
  */
 class LatinOcrResult(
     val lines: List<TextLine>,
@@ -87,16 +89,24 @@ internal class LatinOcrRescue : AutoCloseable {
             if (best != null && best.second >= MATCH_SCORE) {
                 val line = out[best.first]
                 val old = normalize(line.text)
-                if (line.direction == "h" && shouldReplace(old, candidate.text)) {
-                    EngineTrace.log("ocr.latin.replace '${old.take(28)}' -> '${candidate.text.take(28)}'")
-                    line.text = candidate.text
+                if (line.direction == "h" && isMostlyLatin(old)) {
+                    // Even when we keep the NCNN transcription, use ML Kit's tighter Latin box
+                    // for removal so English remnants are not left under the Arabic text.
+                    added += Rect(candidate.rect)
+                    if (shouldReplace(old, candidate.text)) {
+                        EngineTrace.log("ocr.latin.replace '${old.take(28)}' -> '${candidate.text.take(28)}'")
+                        line.text = candidate.text
+                    }
                 }
                 continue
             }
 
-            // New DBNet-missed rescue lines: only accept clearly horizontal Latin dialogue.
+            // New DBNet-missed rescue lines: only accept clearly horizontal Latin dialogue that
+            // sits on a relatively uniform bubble-like local background. This rejects most
+            // scan-site logos/watermarks painted across detailed artwork.
             val horizontal = candidate.rect.width() >= candidate.rect.height() * MIN_HORIZONTAL_RATIO
             if (!horizontal) continue
+            if (!looksLikeBubbleBackground(page, candidate.rect)) continue
             if (out.any { overlapScore(candidate.rect, it) >= NEW_LINE_DUPLICATE_SCORE }) continue
 
             val r = candidate.rect
@@ -177,7 +187,16 @@ internal class LatinOcrRescue : AutoCloseable {
         val letters = t.count { it.isLetter() }
         if (letters < 2) return false
         val latin = t.count { isLatinLetter(it) }
-        return latin.toFloat() / letters >= MIN_LATIN_RATIO
+        if (latin.toFloat() / letters < MIN_LATIN_RATIO) return false
+
+        // Reject obvious OCR garbage such as Y-4ou / a12b before it reaches translation.
+        if (Regex("""(?i)\b(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*\d)[a-z0-9-]{3,}\b""").containsMatchIn(t)) return false
+
+        // Very short unknown fragments are more often clipped OCR than dialogue.
+        val compact = t.filter { isLatinLetter(it) }.lowercase()
+        if (compact.length <= 3 && compact !in SHORT_DIALOGUE_ALLOW) return false
+
+        return true
     }
 
     private fun isMostlyLatin(value: String): Boolean {
@@ -190,10 +209,53 @@ internal class LatinOcrRescue : AutoCloseable {
         ch in 'A'..'Z' || ch in 'a'..'z' || ch.code in 0x00C0..0x024F
 
     private fun isLikelyWatermark(value: String): Boolean {
-        val s = value.lowercase()
+        val s = value.lowercase().replace(" ", "")
         if (Regex("""(?:https?://|www\.|[a-z0-9-]+\.(?:com|org|net|io|ink|co)\b)""").containsMatchIn(s)) return true
-        if ((s.contains("manga") || s.contains("comic") || s.contains("scanlat")) && s.length <= 32) return true
+        if (listOf("manga", "comic", "scanlat", "scanlation", "webtoon", "manhwa").any { it in s } && s.length <= 40) return true
+        // OCR often drops punctuation from site marks (e.g. LIKE MANGA . INK -> likemangaink).
+        if (s.endsWith("ink") && ("manga" in s || "comic" in s || "like" in s) && s.length <= 32) return true
         return false
+    }
+
+    private fun looksLikeBubbleBackground(page: Bitmap, rect: Rect): Boolean {
+        val padX = (rect.width() * 0.35f).toInt().coerceAtLeast(6)
+        val padY = (rect.height() * 0.80f).toInt().coerceAtLeast(8)
+        val l = (rect.left - padX).coerceIn(0, page.width - 1)
+        val t = (rect.top - padY).coerceIn(0, page.height - 1)
+        val r = (rect.right + padX).coerceIn(l + 1, page.width)
+        val b = (rect.bottom + padY).coerceIn(t + 1, page.height)
+
+        val stepX = ((r - l) / 24).coerceAtLeast(1)
+        val stepY = ((b - t) / 16).coerceAtLeast(1)
+        var n = 0
+        var sum = 0.0
+        var sum2 = 0.0
+        var y = t
+        while (y < b) {
+            var x = l
+            while (x < r) {
+                // Prefer samples outside the text rectangle so glyph strokes themselves do not
+                // make an otherwise clean bubble look noisy.
+                if (x !in rect.left..rect.right || y !in rect.top..rect.bottom) {
+                    val p = page.getPixel(x, y)
+                    val lum = 0.299 * ((p shr 16) and 0xFF) +
+                        0.587 * ((p shr 8) and 0xFF) +
+                        0.114 * (p and 0xFF)
+                    sum += lum
+                    sum2 += lum * lum
+                    n++
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+        if (n < 24) return false
+        val mean = sum / n
+        val variance = (sum2 / n - mean * mean).coerceAtLeast(0.0)
+        val std = kotlin.math.sqrt(variance)
+
+        // White/cream bubbles are very uniform. Dark bubbles are accepted too if locally uniform.
+        return std <= MAX_BUBBLE_LUMA_STD
     }
 
     private fun overlapScore(rect: Rect, line: TextLine): Float {
@@ -239,5 +301,9 @@ internal class LatinOcrRescue : AutoCloseable {
         private const val MIN_HORIZONTAL_RATIO = 1.10f
         private const val MATCH_SCORE = 0.28f
         private const val NEW_LINE_DUPLICATE_SCORE = 0.12f
+        private const val MAX_BUBBLE_LUMA_STD = 48.0
+        private val SHORT_DIALOGUE_ALLOW = setOf(
+            "i", "a", "no", "ok", "yes", "why", "who", "hey", "go", "run", "ow", "oh", "ah", "huh",
+        )
     }
 }
