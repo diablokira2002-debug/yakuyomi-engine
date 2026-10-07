@@ -3,8 +3,6 @@ package li.joye.yakuyomi.engine
 import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.util.Log
-import kotlinx.coroutines.async
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 
 /**
@@ -39,7 +37,7 @@ data class PageStats(
     val translateMs: Long,
     val inpaintMs: Long,
     val renderMs: Long,
-    val wallMs: Long = 0,   // 實際牆鐘時間（去字‖翻譯重疊 ⇒ 通常 < totalMs；省下的＝重疊掉的）
+    val wallMs: Long = 0,   // 實際牆鐘時間
     val promptTokens: Int = 0,      // 本頁 LLM 請求的 prompt token（無 LLM/代理不回＝0）。供統計：用量只記、不計價。
     val completionTokens: Int = 0,  // 本頁 LLM 請求的 completion token。
 ) {
@@ -53,10 +51,10 @@ data class PageStats(
  *
  * **§11 不變式焊進此處：永不用比原圖更糟的東西覆蓋。**
  *   - 偵測不到字 / OCR 全空 / 譯文全失敗 → [PageResult.Skipped]（保留原圖、不覆蓋；去字若已並發跑出來也丟棄）。
- *   - 單 block 翻譯失敗 → **去字後重貼 OCR 原文**（日文）——非「保留源圖」。讓去字不必等翻譯 ⇒ 去字(CPU)與翻譯(網路)並發重疊。
+ *   - 單 block 翻譯失敗 → 保留 OCR 原文；本地翻譯成功後才進行去字，避免失敗時白跑 AOT-GAN。
  *   - 任一階段拋例外（網路/429 重試後仍失敗等）→ [PageResult.Failed]（保留原圖、不覆蓋、可重試；丟棄已並發的去字）。
  *
- * **去字‖翻譯重疊**：兩者只依賴 OCR、互不爭資源（網路 vs CPU）⇒ 同時跑，[PageStats.wallMs] < [PageStats.totalMs]（省下重疊掉的）。
+ * **本地翻譯模式**：翻譯與 AOT-GAN 依序執行，降低手機上的 CPU/RAM 競爭並提高穩定性。
  *
  * 模型由呼叫端建好傳入；本類不碰檔案、不管跨頁批次與 resume。
  * **生命週期**：[close] 會收掉傳入的 detector/ocr/inpainter 的原生 session ——
@@ -106,33 +104,24 @@ class Pipeline(
             return@coroutineScope PageResult.Skipped("OCR 全空", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0))
         }
 
-        // ★ 去字（CPU）‖ 翻譯（網路）並發：兩者只依賴 OCR，可同時跑（網路等待時 CPU 去字、互不爭資源）。
-        // §11 改：失敗區不再「保留源圖」，而是「去字後重貼 OCR 原文」(使用者拍板：重貼成本低、不需源圖狀態) ⇒ 去字與翻譯解耦。
-        // 不限去字方法（boxfill/lama 皆可重疊）。boxfill(~0.5s)整段藏進翻譯(~2.7s)＝免費。
-        var inpaintMs = 0L
-        val inpaintJob = async {
-            val t0 = System.currentTimeMillis()
-            EngineTrace.log("pipe.inpaint.enter regions=${textRegions.size}")
-            val r = inpainter.inpaint(page, textRegions, detection.textMask)
-            EngineTrace.log("pipe.inpaint.exit")
-            inpaintMs = System.currentTimeMillis() - t0
-            r
-        }
-
+        // Local Arabic build:
+        // Translation now runs on-device (ML Kit), so do NOT run it in parallel with AOT inpainting.
+        // Both stages can consume CPU/RAM; running them sequentially is more stable on phones and
+        // avoids wasting an expensive inpaint pass when translation fails.
         var translateMs = 0L
         var promptTok = 0
         var completionTok = 0
-        // per-call 診斷 metadata（區域變數、不讀 LlmTranslator 的共享單值欄位 → 跨頁併發各頁拿自己的、不 race）。
         var llmError: String? = null
         var llmRaw: String? = null
+
         if (translator != null) {
             val tTr = System.currentTimeMillis()
             EngineTrace.log("pipe.translate.enter n=${textRegions.size}")
-            val cht = try {
-                val llm = translator as? LlmTranslator
-                if (llm != null) {
-                    // 走 translateDetailed → per-call 拿 translations + usage + error + raw（跨頁併發安全）。
-                    val r = llm.translateDetailed(textRegions.map { it.sourceText })
+            val translated = try {
+                val local = translator as? LlmTranslator
+                if (local != null) {
+                    // LlmTranslator is API-compatible but now performs local English -> Arabic translation.
+                    val r = local.translateDetailed(textRegions.map { it.sourceText })
                     r.usage?.let { promptTok = it.promptTokens; completionTok = it.completionTokens }
                     llmError = r.error
                     llmRaw = r.raw
@@ -142,14 +131,16 @@ class Pipeline(
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "翻譯失敗", t)
-                inpaintJob.cancelAndJoin() // 翻譯掛 → 丟棄去字、留原圖（§11；native run 不可中斷，cancel 實為等它跑完再丟）
                 return@coroutineScope PageResult.Failed("translate: ${t.message}")
             }
-            textRegions.forEachIndexed { j, r -> r.translatedText = cht.getOrElse(j) { r.sourceText } }
+
+            textRegions.forEachIndexed { j, region ->
+                region.translatedText = translated.getOrElse(j) { region.sourceText }
+            }
             translateMs = System.currentTimeMillis() - tTr
             EngineTrace.log("pipe.translate.exit err=$llmError")
         } else {
-            textRegions.forEach { it.translatedText = it.sourceText } // 無 key debug：排版原文
+            textRegions.forEach { it.translatedText = it.sourceText }
         }
 
         // 判定每區譯文有效性（空白/數字/regex/譯==原＝失敗）。整頁全失敗 → 留原圖（Skipped、丟棄去字）。
@@ -158,7 +149,6 @@ class Pipeline(
             val aligned = textRegions.count { it.translatedText.isNotBlank() && it.translatedText != it.sourceText }
             val dbg = textRegions.take(2).joinToString(" ‖ ") { "${it.sourceText.take(8)}→${it.translatedText.take(8)}" }
             Log.w(TAG, "全數過濾 對齊$aligned/${textRegions.size} err=$llmError 回應=$llmRaw")
-            inpaintJob.cancelAndJoin()
             // §11 盲點修正：分辨「網路/格式軟失敗」vs「真的全不可譯」。
             // LlmTranslator 對網路/HTTP 例外是「catch + 回傳原文」（不丟例外）→ 全頁 translated==source → 落到這裡全數過濾。
             // 若一律回 Skipped(標記略過、算已處理)，網路失敗的頁會被當「已翻」、整章不變紅（正是此盲點）。改用 error 分流（per-call、不 race）：
@@ -180,12 +170,18 @@ class Pipeline(
         val keptSet = kept.toHashSet()
         textRegions.forEach { if (it !in keptSet) it.translatedText = it.sourceText }
 
-        // 等去字完成（多半已與翻譯重疊跑完）
-        EngineTrace.log("pipe.inpaint.await")
+        // Translation succeeded; now remove the source text.
+        var inpaintMs = 0L
+        EngineTrace.log("pipe.inpaint.enter regions=${textRegions.size}")
         val cleaned = try {
-            inpaintJob.await()
+            val t0 = System.currentTimeMillis()
+            val result = inpainter.inpaint(page, textRegions, detection.textMask)
+            inpaintMs = System.currentTimeMillis() - t0
+            EngineTrace.log("pipe.inpaint.exit")
+            result
         } catch (t: Throwable) {
-            Log.e(TAG, "去字失敗", t); return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
+            Log.e(TAG, "去字失敗", t)
+            return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
         }
 
         // 排版（全 textRegions：kept 貼譯文、失敗區貼原文）
@@ -221,6 +217,7 @@ class Pipeline(
 
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
+        runCatching { (translator as? LlmTranslator)?.closeLocalTranslator() }
         runCatching { detector.close() }
         runCatching { ocr.close() }
         runCatching { inpainter.close() }
