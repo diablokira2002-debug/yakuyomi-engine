@@ -38,28 +38,151 @@ class Inpainter(
         val w = page.width
         val h = page.height
         val result = page.copy(Bitmap.Config.ARGB_8888, true)
-        // seg 細筆畫遮罩 ∩ 保留區 bbox（外擴 bboxPad）再膨脹：只動筆畫、限制在翻譯過的區（SFX/未譯留原圖，§11）。
-        val maskPx = buildSegMask(regions, textMask, w, h)
 
+        // Speech on a uniform white balloon is a DIFFERENT problem from speech painted
+        // over artwork. Native-resolution flat cleanup is more reliable than shrinking
+        // a whole webtoon page to a 768px AOT input and erasing only a partial seg mask.
+        // Use it only when the entire padded region is demonstrably light and uniform;
+        // otherwise keep the original AOT / boxfill behavior.
+        val complex = ArrayList<TextRegion>()
+        for (region in regions) {
+            if (tryClearUniformBalloon(page, result, region)) {
+                region.onArt = false
+                EngineTrace.log("inpaint.flat_balloon source='${region.sourceText.take(40)}'")
+            } else {
+                complex += region
+            }
+        }
+
+        if (complex.isEmpty()) return@coroutineScope result
+
+        // Restrict all remaining segmentation/AOT operations to successfully translated
+        // regions we were NOT able to clear safely on their own backgrounds.
+        val maskPx = buildSegMask(complex, textMask, w, h)
         if (cfg.method == "boxfill") {
-            // 逐區平塗背景色：白泡乾淨無殘留、忙碌區是平色塊（要品質用 aot）。
-            val px = IntArray(w * h); result.getPixels(px, 0, w, 0, 0, w, h)
-            val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
-            for (r in regions) {
+            val px = IntArray(w * h)
+            result.getPixels(px, 0, w, 0, 0, w, h)
+            val tightPx = IntArray(w * h)
+            textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
+            for (r in complex) {
                 val s = bgStats(px, tightPx, r, w, h)
-                r.onArt = false; r.dbgStd = s.std; r.dbgWhite = s.meanLum // dbg 值給 sandbox 去背比較標框
+                r.onArt = false
+                r.dbgStd = s.std
+                r.dbgWhite = s.meanLum
                 flatFill(result, maskPx, r, s.color, cfg.bboxPad, w, h)
             }
             return@coroutineScope result
         }
 
-        // aot（預設）：全區都跑 AOT-GAN 整頁重建；標 onArt 讓 Renderer 給黑字粗白邊。
-        regions.forEach { it.onArt = true }
+        complex.forEach { it.onArt = true }
         val maskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         maskBmp.setPixels(maskPx, 0, w, 0, 0, w, h)
-        runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
-        maskBmp.recycle()
+        try {
+            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+        } finally {
+            maskBmp.recycle()
+        }
         result
+    }
+
+    /**
+     * Erase the COMPLETE detected text rectangle (not just DBNet glyph fragments) only
+     * when a speech region is inside a reliably bright, almost single-color background.
+     * This removes entire English glyphs, including anti-alias edges and letters that
+     * DBNet's mask missed, without touching gradients, artwork or the balloon outline.
+     *
+     * All sampling comes from the UNMODIFIED source bitmap. Every corner must be bright,
+     * at least 68% of sampled points must be bright, and their luma range must be small.
+     * If this is not safe, return false and leave the original AOT path in charge.
+     */
+    private fun tryClearUniformBalloon(original: Bitmap, result: Bitmap, region: TextRegion): Boolean {
+        // Never erase using this shortcut for unrecognized/non-Latin text.
+        if (!region.sourceText.any { it in 'A'..'Z' || it in 'a'..'z' }) return false
+        if (region.translatedText.none { it.code in 0x0621..0x064A }) return false
+
+        val w = original.width
+        val h = original.height
+        val bw = (region.x1 - region.x0).toInt()
+        val bh = (region.y1 - region.y0).toInt()
+        if (bw < 12 || bh < 8) return false
+
+        // Allow for uncertain glyph bounds without expanding as far as a balloon outline.
+        val pad = minOf(7, maxOf(2, (minOf(bw, bh) * 0.07f).toInt()))
+        val x0 = (region.x0.toInt() - pad).coerceAtLeast(0)
+        val y0 = (region.y0.toInt() - pad).coerceAtLeast(0)
+        val x1 = (region.x1.toInt() + pad + 1).coerceAtMost(w)
+        val y1 = (region.y1.toInt() + pad + 1).coerceAtMost(h)
+        if (x1 - x0 < 12 || y1 - y0 < 8) return false
+
+        val areaW = x1 - x0
+        val areaH = y1 - y0
+        val samples = ArrayList<Int>()
+        var bright = 0
+        var count = 0
+        var minLuma = 255
+        var maxLuma = 0
+        val step = maxOf(1, minOf(areaW, areaH) / 30)
+        for (y in y0 until y1 step step) {
+            for (x in x0 until x1 step step) {
+                val p = original.getPixel(x, y)
+                val red = (p shr 16) and 255
+                val green = (p shr 8) and 255
+                val blue = p and 255
+                val luma = (red * 299 + green * 587 + blue * 114) / 1000
+                count++
+                // Restrict to near-neutral whites. Colored balloons stay in AOT mode.
+                if (luma >= 213 && maxOf(red, green, blue) - minOf(red, green, blue) <= 28) {
+                    bright++
+                    samples.add(p)
+                    minLuma = minOf(minLuma, luma)
+                    maxLuma = maxOf(maxLuma, luma)
+                }
+            }
+        }
+        if (count < 20 || bright < count * 0.68f || maxLuma - minLuma > 28) return false
+
+        // Guard against a balloon outline / artwork crossing the padding corners.
+        val corners = arrayOf(
+            x0 to y0, (x1 - 1) to y0, x0 to (y1 - 1), (x1 - 1) to (y1 - 1),
+        )
+        for ((cx, cy) in corners) {
+            var localLight = 0
+            var localN = 0
+            for (dy in -2..2) for (dx in -2..2) {
+                val sx = (cx + dx).coerceIn(0, w - 1)
+                val sy = (cy + dy).coerceIn(0, h - 1)
+                val p = original.getPixel(sx, sy)
+                val red = (p shr 16) and 255
+                val green = (p shr 8) and 255
+                val blue = p and 255
+                val lum = (red * 299 + green * 587 + blue * 114) / 1000
+                if (lum >= 213 && maxOf(red, green, blue) - minOf(red, green, blue) <= 28) localLight++
+                localN++
+            }
+            if (localLight < localN * 0.80f) return false
+        }
+
+        // Use the modal bright color instead of averaging text-darkened pixels.
+        // Solid white balloons thus stay white without a grey bounding-box artifact.
+        val bins = HashMap<Int, Int>()
+        for (p in samples) {
+            val key = ((p shr 19) and 31) shl 10 or
+                (((p shr 11) and 31) shl 5) or ((p shr 3) and 31)
+            bins[key] = (bins[key] ?: 0) + 1
+        }
+        val mode = bins.maxByOrNull { it.value }?.key ?: return false
+        val mr = ((mode shr 10) and 31) * 8 + 4
+        val mg = ((mode shr 5) and 31) * 8 + 4
+        val mb = (mode and 31) * 8 + 4
+        val color = android.graphics.Color.rgb(mr.coerceAtMost(255), mg.coerceAtMost(255), mb.coerceAtMost(255))
+        android.graphics.Canvas(result).drawRect(
+            x0.toFloat(), y0.toFloat(), x1.toFloat(), y1.toFloat(),
+            android.graphics.Paint().apply {
+                this.color = color
+                style = android.graphics.Paint.Style.FILL
+            },
+        )
+        return true
     }
 
     /**
