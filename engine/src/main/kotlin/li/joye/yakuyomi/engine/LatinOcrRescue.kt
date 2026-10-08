@@ -85,7 +85,15 @@ internal class LatinOcrRescue : AutoCloseable {
         for (candidate in candidates) {
             val overlaps = out.mapIndexedNotNull { index, line ->
                 val score = overlapScore(candidate.rect, line)
-                if (score >= PRIMARY_MATCH_SCORE && line.direction == "h" && isMostlyLatin(line.text)) {
+                // NCNN may misclassify an English line as vertical or emit noisy
+                // gibberish. A genuine ML Kit Latin block overrides ANY intersecting
+                // non-CJK NCNN fragment, avoiding duplicate English text and corrupt
+                // English/Arabic mixed groups.
+                val cjk = line.text.any {
+                    it.code in 0x3040..0x30FF || it.code in 0x3400..0x9FFF ||
+                        it.code in 0xAC00..0xD7AF
+                }
+                if (score >= PRIMARY_MATCH_SCORE && !cjk) {
                     index to score
                 } else {
                     null
