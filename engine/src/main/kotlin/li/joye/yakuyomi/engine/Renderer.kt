@@ -49,8 +49,11 @@ object Renderer {
             val (fillColor, outlineColor) = textColors(page, region, cfg)
             fill.color = fillColor
             stroke.color = outlineColor
-            val vertical = when (cfg.orientation) {
-                TextOrientation.AUTO -> region.direction == "v" // 跟著偵測到的原文方向（對齊 m-i-t），不再無腦直排
+            // Arabic glyphs require contextual shaping and bidi layout. Even if OCR
+            // classified the ORIGINAL English text as vertical (or the user forced
+            // vertical CJK typesetting), Arabic must always use horizontal StaticLayout.
+            val vertical = if (isArabic(text)) false else when (cfg.orientation) {
+                TextOrientation.AUTO -> region.direction == "v"
                 TextOrientation.VERTICAL -> true
                 TextOrientation.HORIZONTAL -> false
             }
