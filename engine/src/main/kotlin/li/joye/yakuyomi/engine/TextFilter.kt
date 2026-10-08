@@ -62,6 +62,12 @@ internal object TextFilter {
         val sourceAlreadyArabic = containsArabicLetter(source)
         if (sourceHasLetters && !sourceAlreadyArabic && !containsArabicLetter(translated)) return true
 
+        // ML Kit can pass through nonsense Latin OCR tokens (e.g. "diteedeawt")
+        // while translating the rest into Arabic. Never paint this broken bilingual
+        // output over the original speech bubble: keep the original image untouched.
+        // Small acronyms may be legitimate; guard only long Latin word fragments.
+        if (!sourceAlreadyArabic && Regex("""[A-Za-z]{4,}""").containsMatchIn(translated)) return true
+
         // Reject extremely symbol-heavy translated output as a last safety net.
         val visible = translated.count { !it.isWhitespace() }
         if (visible >= 4) {
