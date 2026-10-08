@@ -40,6 +40,17 @@ class TextFilterTest {
         assertEquals("مرحبا", kept[0].translatedText)
     }
 
+    @Test fun keepsOriginalWhenMachineTranslationLeaksOcrGarbage() {
+        val kept = TextFilter.apply(
+            listOf(
+                region("very skilled", "ماهر جدا diteedeawt"),
+                region("this time", "هذه المرة"),
+            ),
+        )
+        assertEquals(1, kept.size)
+        assertEquals("هذه المرة", kept[0].translatedText)
+    }
+
     @Test fun dropsRegexMatch() {
         val kept = TextFilter.apply(
             listOf(region("x", "إعلان مدفوع"), region("y", "نص طبيعي")),
