@@ -171,10 +171,22 @@ class Inpainter(
             bins[key] = (bins[key] ?: 0) + 1
         }
         val mode = bins.maxByOrNull { it.value }?.key ?: return false
-        val mr = ((mode shr 10) and 31) * 8 + 4
-        val mg = ((mode shr 5) and 31) * 8 + 4
-        val mb = (mode and 31) * 8 + 4
-        val color = android.graphics.Color.rgb(mr.coerceAtMost(255), mg.coerceAtMost(255), mb.coerceAtMost(255))
+        var sr = 0L
+        var sg = 0L
+        var sb = 0L
+        var n = 0
+        for (p in samples) {
+            val key = ((p shr 19) and 31) shl 10 or
+                (((p shr 11) and 31) shl 5) or ((p shr 3) and 31)
+            if (key == mode) {
+                sr += (p shr 16) and 255
+                sg += (p shr 8) and 255
+                sb += p and 255
+                n++
+            }
+        }
+        if (n == 0) return false
+        val color = android.graphics.Color.rgb((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt())
         android.graphics.Canvas(result).drawRect(
             x0.toFloat(), y0.toFloat(), x1.toFloat(), y1.toFloat(),
             android.graphics.Paint().apply {
