@@ -167,36 +167,10 @@ class LlmParamsTest {
         assertFalse(params("gemini", "gemini-3.1-flash-lite-image").containsKey("reasoning_effort"))
     }
 
-    // ── 思考參數自癒（收到 400 就脫掉思考欄位重送）──
-
-    @Test fun thinkingRejectionIsRecognisedAcrossProviders() {
-        // 各家實測過的拒收訊息都要認得（Gemini 3.8-flash 實例＝2026-09-04 使用者回報）
-        assertTrue(
-            LlmTranslator.isThinkingParamRejection(
-                """HTTP 400 {"error":{"code":400,"message":"Thinking level MINIMAL is not supported """ +
-                    """for this model. Please retry with other thinking level.","status":"INVALID_ARGUMENT"}}""",
-            ),
-        )
-        assertTrue(
-            LlmTranslator.isThinkingParamRejection(
-                """HTTP 400 {"error":{"message":"reasoning_effort is not supported with this model"}}""",
-            ),
-        )
-        assertTrue(
-            LlmTranslator.isThinkingParamRejection(
-                """HTTP 400 {"error":{"message":"Unsupported parameter: 'reasoning_effort'"}}""",
-            ),
-        )
-    }
-
-    @Test fun unrelatedFailuresAreNotTreatedAsThinkingRejection() {
-        // 脫思考參數救不了的錯不能誤判（否則白花一次請求、還蓋掉真正的錯誤訊息）
-        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 400 {"error":{"message":"Model Not Exist"}}"""))
-        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 401 {"error":{"message":"invalid api key"}}"""))
-        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 402 insufficient balance"""))
-        // 非 400 的思考字眼（例如 429 訊息裡提到 reasoning）不重試
-        assertFalse(LlmTranslator.isThinkingParamRejection("""HTTP 429 reasoning tokens rate limit"""))
-    }
+    // The legacy cloud-HTTP thinking-param recovery was removed when the app
+    // migrated to on-device ML Kit translation. Cloud request-parameter
+    // compatibility tests above remain, but tests of the deleted HTTP client
+    // should not block local translation engine regression tests.
 
     @Test fun qwenTemperatureClampsInsideOpenInterval() {
         // DashScope 官方：「Range: [0, 2). Do not set to 0.」——0 與 2 都不合法，送了 400。

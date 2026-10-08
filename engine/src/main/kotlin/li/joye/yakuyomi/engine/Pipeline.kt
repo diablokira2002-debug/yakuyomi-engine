@@ -70,6 +70,8 @@ class Pipeline(
     private val typeface: Typeface? = null,
 ) : TranslationEngine {
 
+    private val latinOcrRescue = LatinOcrRescue()
+
     override suspend fun translatePage(page: Bitmap): PageResult = coroutineScope {
         val tWall = System.currentTimeMillis()
         EngineTrace.log("pipe.page.enter ${page.width}x${page.height}")
@@ -80,28 +82,46 @@ class Pipeline(
         } catch (t: Throwable) {
             Log.e(TAG, "偵測失敗", t); return@coroutineScope PageResult.Failed("detect: ${t.message}")
         }
-        val lines = detection.lines
+        var lines = detection.lines
         EngineTrace.log("pipe.detect.done lines=${lines.size}")
         val detectMs = System.currentTimeMillis() - tDet
-        if (lines.isEmpty()) {
-            return@coroutineScope PageResult.Skipped("偵測不到文字", PageStats(0, 0, 0, detectMs, 0, 0, 0, 0))
+
+        // OCR + Latin rescue + grouping.
+        // Even when DBNet finds zero lines, ML Kit Latin OCR gets one chance to recover English dialogue.
+        val tOcr = System.currentTimeMillis()
+        if (lines.isNotEmpty()) {
+            EngineTrace.log("pipe.ocr.enter lines=${lines.size}")
+            try {
+                ocr.recognize(page, lines)
+            } catch (t: Throwable) {
+                Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
+            }
+            EngineTrace.log("pipe.ocr.exit")
         }
 
-        // OCR + 分群
-        val tOcr = System.currentTimeMillis()
-        EngineTrace.log("pipe.ocr.enter lines=${lines.size}")
-        try {
-            ocr.recognize(page, lines)
-        } catch (t: Throwable) {
-            Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
+        EngineTrace.log("pipe.ocr.latin.enter primary=${lines.size}")
+        val latin = latinOcrRescue.rescue(page, lines)
+        lines = latin.lines
+        val effectiveMask = latin.augmentMask(detection.textMask)
+        if (effectiveMask !== detection.textMask) {
+            detection.textMask.recycle()
         }
-        EngineTrace.log("pipe.ocr.exit")
+        EngineTrace.log("pipe.ocr.latin.exit lines=${lines.size}")
+
+        if (lines.isEmpty()) {
+            return@coroutineScope PageResult.Skipped("偵測不到文字", PageStats(0, 0, 0, detectMs, System.currentTimeMillis() - tOcr, 0, 0, 0))
+        }
+
         val regions = Grouping.group(lines)
         val ocrMs = System.currentTimeMillis() - tOcr
-        // 去字集＝有 OCR 原文的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
-        val textRegions = regions.filter { it.sourceText.isNotBlank() }
+        // Arabic V2: only obvious, useful OCR text is sent to translation.
+        // Rejected OCR noise is never erased from the manga page.
+        val textRegions = TextFilter.sourceCandidates(regions)
         if (textRegions.isEmpty()) {
-            return@coroutineScope PageResult.Skipped("OCR 全空", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0))
+            return@coroutineScope PageResult.Skipped(
+                "OCR 沒有可翻譯文字",
+                PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0),
+            )
         }
 
         // Local Arabic build:
@@ -143,6 +163,13 @@ class Pipeline(
             textRegions.forEach { it.translatedText = it.sourceText }
         }
 
+        // Never erase/redraw a partially translated page: retry the entire original page.
+        // An error includes a single failed bubble, not just total translation failure.
+        if (llmError != null) {
+            EngineTrace.log("pipe.translate.failed $llmError")
+            return@coroutineScope PageResult.Failed("Local translation incomplete: $llmError")
+        }
+
         // 判定每區譯文有效性（空白/數字/regex/譯==原＝失敗）。整頁全失敗 → 留原圖（Skipped、丟棄去字）。
         val kept = if (translator != null) TextFilter.apply(textRegions, cfg.translator.filterText) else textRegions
         if (kept.isEmpty()) {
@@ -166,16 +193,16 @@ class Pipeline(
                 )
             }
         }
-        // 失敗的區（不在 kept）→ 譯文改回原文＝去字後重貼 OCR 日文（TextRegion 無 equals override→HashSet 走 identity）。
-        val keptSet = kept.toHashSet()
-        textRegions.forEach { if (it !in keptSet) it.translatedText = it.sourceText }
+        // Only successfully translated regions may be erased/redrawn.
+        // Failed/untranslated/noisy regions remain untouched in the original page.
+        val renderRegions = kept
 
-        // Translation succeeded; now remove the source text.
+        // Translation succeeded; now remove source text only for the safe translated regions.
         var inpaintMs = 0L
-        EngineTrace.log("pipe.inpaint.enter regions=${textRegions.size}")
+        EngineTrace.log("pipe.inpaint.enter regions=${renderRegions.size}")
         val cleaned = try {
             val t0 = System.currentTimeMillis()
-            val result = inpainter.inpaint(page, textRegions, detection.textMask)
+            val result = inpainter.inpaint(page, renderRegions, effectiveMask)
             inpaintMs = System.currentTimeMillis() - t0
             EngineTrace.log("pipe.inpaint.exit")
             result
@@ -184,10 +211,10 @@ class Pipeline(
             return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
         }
 
-        // 排版（全 textRegions：kept 貼譯文、失敗區貼原文）
+        // 排版 only the regions that produced a safe Arabic translation.
         val tRn = System.currentTimeMillis()
         EngineTrace.log("pipe.render.enter")
-        val finalPage = Renderer.render(cleaned, textRegions, cfg.render, typeface)
+        val finalPage = Renderer.render(cleaned, renderRegions, cfg.render, typeface)
         val renderMs = System.currentTimeMillis() - tRn
         EngineTrace.log("pipe.page.done")
 
@@ -197,7 +224,7 @@ class Pipeline(
                 lines.size, regions.size, kept.size, detectMs, ocrMs, translateMs, inpaintMs, renderMs,
                 System.currentTimeMillis() - tWall, promptTok, completionTok,
             ),
-            PageAnalysis(detection.textMask, textRegions),
+            PageAnalysis(effectiveMask, renderRegions),
         )
     }
 
@@ -218,6 +245,7 @@ class Pipeline(
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
         runCatching { (translator as? LlmTranslator)?.closeLocalTranslator() }
+        runCatching { latinOcrRescue.close() }
         runCatching { detector.close() }
         runCatching { ocr.close() }
         runCatching { inpainter.close() }

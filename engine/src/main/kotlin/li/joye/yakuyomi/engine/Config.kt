@@ -32,6 +32,19 @@ data class DetectorConfig(
     val dbBinThreshold: Float = 0.5f,     // DB binarize：sigmoid(db ch0) > 此（m-i-t text_threshold=0.5）
     val dbBoxThreshold: Float = 0.7f,     // DB score 過濾：component-mean prob < 此丟（m-i-t box_threshold=0.7）
     val dbUnclipRatio: Float = 2.3f,      // DB unclip 膨脹（m-i-t unclip_ratio=2.3）
+
+    // Arabic V2 detector rescue pass. It reuses the SAME DBNet probability map (no second neural inference)
+    // with slightly softer thresholds, then keeps only small/high-confidence/non-duplicate boxes.
+    // This targets small speech text that sits just below the normal DBNet threshold without turning
+    // manga artwork into a flood of OCR candidates.
+    val rescueSmallText: Boolean = true,
+    val rescueBinThreshold: Float = 0.42f,
+    val rescueBoxThreshold: Float = 0.60f,
+    val rescueUnclipRatio: Float = 2.0f,
+    val rescueMaxShortSideRatio: Float = 0.12f,
+    val rescueMaxLongSideRatio: Float = 0.55f,
+    val rescueDuplicateIou: Float = 0.35f,
+    val rescueMaxExtraLines: Int = 24,
 )
 
 data class OcrConfig(
@@ -50,6 +63,11 @@ data class OcrConfig(
     //   pad=8/12 開始退步（8：弄壞 2；12：弄壞 1）⇒ 4 是甜蜜點。桌面 m-i-t warp 模擬曾給 +15% 讀出，真機只 +2
     //   （引擎自刻 bicubic warp 的 baseline 已達 98%），故真機定值不可照抄桌面。
     val stripPad: Int = 4,
+    // Arabic V2 selective rescue pass: only low-confidence/empty/noisy lines are retried with a wider crop.
+    // Keeps the proven pad=4 fast path for normal text, while giving clipped English/small bubbles one second chance.
+    val rescuePad: Int = 10,
+    val rescueBelowProb: Float = 0.72f,
+    val rescueMinGain: Float = 0.08f,
     // 逐行並發 OCR：小圖塊（48px 高、窄）吃不滿 intra-op 4 緒 → 改「每行單緒、N 行並發」把核填滿。
     // concurrent=true → NCNN Net num_threads 設 1（單行單緒、逐條 forward 不進 ncnn 全域鎖）、靠 Semaphore(concurrency) 並發；
     // false → 單行用滿 NUM_THREADS、序列。純 CPU ⇒ 收益需實測（sandbox 去背比較 OCR 列 A/B）。與「批次 padding」不同：零 padding 浪費。

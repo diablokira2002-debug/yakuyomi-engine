@@ -3,30 +3,36 @@ package li.joye.yakuyomi.engine
 import android.util.Log
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.languageid.LanguageIdentification
+import com.google.mlkit.nl.languageid.LanguageIdentificationOptions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 /** Token usage kept for binary/source compatibility with the existing pipeline. */
 data class Usage(val promptTokens: Int, val completionTokens: Int)
 
 /**
- * Free local English -> Arabic translator.
+ * Free on-device translator with automatic source-language detection and Arabic output.
  *
- * This class intentionally keeps the old [LlmTranslator] name and public API so the
- * reader app does not need to change immediately. It no longer sends manga text to
- * DeepSeek/Groq/OpenAI. Translation is performed by ML Kit on the device.
+ * The class intentionally keeps the historical [LlmTranslator] name and public API so
+ * the reader app and the rest of the engine do not need a migration layer.
  *
- * The English and Arabic ML Kit language models are downloaded automatically the
- * first time translation is used. After that, translation works offline.
+ * Flow per text region:
+ *  1. Identify the source language on device with ML Kit Language ID.
+ *  2. Resolve that language to an ML Kit translation model.
+ *  3. Download the required source -> Arabic model once, on demand.
+ *  4. Translate locally. Subsequent use of the downloaded model works offline.
  *
- * Detection, OCR, text removal and re-rendering remain handled by Yakuyomi's local
- * pipeline exactly as before.
+ * No manga text is sent to DeepSeek/OpenAI/Groq or another cloud provider.
+ *
+ * Important: language identification happens after OCR. It can choose the correct
+ * translation model only when the OCR model has already produced usable source text.
  */
 class LlmTranslator(
     @Suppress("UNUSED_PARAMETER") apiKey: String,
@@ -41,17 +47,22 @@ class LlmTranslator(
         val raw: String? = null,
     )
 
-    private val modelMutex = Mutex()
+    // Delay ML Kit client creation until the first actual translation request.
+    // This keeps engine construction lightweight and, more importantly, ensures a
+    // ML Kit initialization problem is reported as a per-page translation failure
+    // instead of aborting construction after the large NCNN models are already loaded.
+    private val languageIdentifierDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        LanguageIdentification.getClient(
+            LanguageIdentificationOptions.Builder()
+                .setConfidenceThreshold(LANGUAGE_CONFIDENCE)
+                .build(),
+        )
+    }
+    private val languageIdentifier by languageIdentifierDelegate
 
-    @Volatile
-    private var modelReady = false
-
-    private val client = Translation.getClient(
-        TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.ENGLISH)
-            .setTargetLanguage(TranslateLanguage.ARABIC)
-            .build(),
-    )
+    private val clients = LinkedHashMap<String, com.google.mlkit.nl.translate.Translator>()
+    private val readyModels = HashSet<String>()
+    private val clientsMutex = Mutex()
 
     var lastError: String? = null
         private set
@@ -59,66 +70,53 @@ class LlmTranslator(
     var lastRaw: String? = null
         private set
 
-    /**
-     * Translate all text regions from one manga page locally.
-     *
-     * Failed individual regions fall back to their OCR source text so Yakuyomi never
-     * destroys a page because one bubble could not be translated. If every region
-     * fails, [error] is populated so the existing pipeline marks the page retryable.
-     */
     suspend fun translateDetailed(queries: List<String>): TranslateResult {
         if (queries.isEmpty()) return TranslateResult(emptyList())
 
-        return try {
-            ensureModelReady()
+        var failed = 0
+        val errors = ArrayList<String>()
+        val translations = ArrayList<String>(queries.size)
 
-            var failed = 0
-            val translations = ArrayList<String>(queries.size)
-
-            for (source in queries) {
-                if (source.isBlank()) {
-                    translations += source
-                    continue
-                }
-
-                val translated = try {
-                    client.translate(source).awaitString()
-                        .trim()
-                        .let { postProcess?.invoke(it) ?: it }
-                        .trim()
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Local translation failed for one region: ${t.message}")
-                    failed++
-                    source
-                }
-
-                translations += translated.ifBlank {
-                    failed++
-                    source
-                }
+        for (sourceRaw in queries) {
+            val source = sourceRaw.trim()
+            if (source.isEmpty()) {
+                translations += sourceRaw
+                continue
             }
 
-            val error = if (failed >= queries.size) {
-                "ML Kit local translation failed for all ${queries.size} regions"
-            } else {
-                null
+            val translated = try {
+                translateOne(source)
+            } catch (t: Throwable) {
+                failed++
+                val message = "${t.javaClass.simpleName}: ${t.message}"
+                errors += message
+                EngineTrace.log("translate.error $message")
+                Log.w(TAG, "Local translation failed for one region: $message")
+                sourceRaw
             }
 
-            TranslateResult(
-                translations = translations,
-                usage = null,
-                error = error,
-                raw = null,
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "Local Arabic translation failed: ${t.message}", t)
-            TranslateResult(
-                translations = queries,
-                usage = null,
-                error = "${t.javaClass.simpleName}: ${t.message}",
-                raw = null,
-            )
+            translations += translated.ifBlank {
+                failed++
+                errors += "Blank translation result"
+                sourceRaw
+            }
         }
+
+        // A partially failed page must NOT be committed as successfully translated.
+        // Pipeline checks this error and keeps the original page for a later retry.
+        val error = if (failed == 0) {
+            null
+        } else {
+            "Local translation failed in $failed of ${queries.count { it.isNotBlank() }} regions: " +
+                errors.distinct().joinToString(" | ")
+        }
+
+        return TranslateResult(
+            translations = translations,
+            usage = null,
+            error = error,
+            raw = null,
+        )
     }
 
     override suspend fun translate(queries: List<String>): List<String> {
@@ -128,26 +126,95 @@ class LlmTranslator(
         return result.translations
     }
 
-    /**
-     * Downloads the English/Arabic language models once when first needed.
-     * No Wi-Fi-only restriction is used so it also works for users on mobile data.
-     */
-    private suspend fun ensureModelReady() {
-        if (modelReady) return
+    private suspend fun translateOne(source: String): String {
+        // Short English manga dialogue ("NO!", "I'M FINE.") is frequently classified
+        // as another Latin language. Preserve English -> Arabic deterministically for
+        // Latin-only speech, while leaving Japanese/Chinese/Korean to language ID.
+        val hasCjk = source.any {
+            it.code in 0x3040..0x30FF || it.code in 0x3400..0x9FFF || it.code in 0xAC00..0xD7AF
+        }
+        val latinOnly = !hasCjk && source.any { it in 'A'..'Z' || it in 'a'..'z' } &&
+            source.none { it.isLetter() && it !in 'A'..'Z' && it !in 'a'..'z' }
+        val sourceLanguage = if (latinOnly) {
+            TranslateLanguage.ENGLISH
+        } else {
+            val detectedTag = languageIdentifier.identifyLanguage(source).awaitString()
+            resolveSourceLanguage(detectedTag, source)
+        }
 
-        modelMutex.withLock {
-            if (modelReady) return
+        // The page is already Arabic: keep it unchanged and avoid a pointless model download.
+        if (sourceLanguage == TranslateLanguage.ARABIC) return source
+
+        val client = getOrCreateClient(sourceLanguage)
+        ensureModelReady(sourceLanguage, client)
+
+        return client.translate(source)
+            .awaitString()
+            .trim()
+            .let { postProcess?.invoke(it) ?: it }
+            .trim()
+    }
+
+    /**
+     * Language ID returns BCP-47 codes (for example en, ja, ko, zh).
+     * ML Kit Translation supports a smaller set, so unsupported/undetermined text
+     * falls back conservatively to English. This preserves the previous build's
+     * behavior while adding automatic Japanese/Chinese/Korean/etc. when supported.
+     */
+    private fun resolveSourceLanguage(detectedTag: String, source: String): String {
+        val normalized = detectedTag.substringBefore('-').lowercase()
+        val mapped = if (normalized == UNDETERMINED) null else TranslateLanguage.fromLanguageTag(normalized)
+
+        if (mapped != null) {
+            EngineTrace.log("translate.lang detected=$normalized mapped=$mapped")
+            return mapped
+        }
+
+        // Script hints improve very short manga bubbles where Language ID may answer "und".
+        val hinted = when {
+            source.any { it.code in 0x3040..0x30FF } -> TranslateLanguage.JAPANESE
+            source.any { it.code in 0xAC00..0xD7AF } -> TranslateLanguage.KOREAN
+            source.any { it.code in 0x4E00..0x9FFF } -> TranslateLanguage.CHINESE
+            source.any { it.code in 0x0600..0x06FF } -> TranslateLanguage.ARABIC
+            else -> TranslateLanguage.ENGLISH
+        }
+        EngineTrace.log("translate.lang detected=$detectedTag fallback=$hinted")
+        return hinted
+    }
+
+    private suspend fun getOrCreateClient(sourceLanguage: String): com.google.mlkit.nl.translate.Translator =
+        clientsMutex.withLock {
+            clients[sourceLanguage] ?: Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(sourceLanguage)
+                    .setTargetLanguage(TranslateLanguage.ARABIC)
+                    .build(),
+            ).also { clients[sourceLanguage] = it }
+        }
+
+    private suspend fun ensureModelReady(
+        sourceLanguage: String,
+        client: com.google.mlkit.nl.translate.Translator,
+    ) {
+        clientsMutex.withLock {
+            if (sourceLanguage in readyModels) return
 
             val conditions = DownloadConditions.Builder().build()
             client.downloadModelIfNeeded(conditions).awaitUnit()
-            modelReady = true
-            Log.i(TAG, "ML Kit English -> Arabic models are ready")
+            readyModels += sourceLanguage
+            Log.i(TAG, "ML Kit $sourceLanguage -> Arabic model is ready")
         }
     }
 
-    /** Can be called later when Pipeline lifecycle is extended to close translators. */
     fun closeLocalTranslator() {
-        runCatching { client.close() }
+        if (languageIdentifierDelegate.isInitialized()) {
+            runCatching { languageIdentifier.close() }
+        }
+        synchronized(clients) {
+            clients.values.forEach { runCatching { it.close() } }
+            clients.clear()
+            readyModels.clear()
+        }
     }
 
     private suspend fun Task<Void>.awaitUnit(): Unit =
@@ -178,5 +245,7 @@ class LlmTranslator(
 
     companion object {
         private const val TAG = "LocalArabicTranslator"
+        private const val UNDETERMINED = "und"
+        private const val LANGUAGE_CONFIDENCE = 0.35f
     }
 }

@@ -131,26 +131,87 @@ class Ocr(
         }
     }
 
-    /** 單行 OCR：裁切→前處理→CTC→填 text。thread-safe：只寫自己的 line、JNI forward 可並發（1 緒 Net 不進全域鎖）、其餘皆 local/唯讀。 */
+    /**
+     * 單行 OCR：正常裁切先跑一次；只有「低信心 / 空白 / 可疑拉丁數字混排」時才以較大的 padding 再跑一次 rescue。
+     *
+     * 這個 rescue 專門處理漫畫常見的「偵測框剛好切掉首尾字」：不把所有 OCR 成本翻倍，只對可疑行多做一次，
+     * 並且只有第二次的信心明顯更高時才採用，避免 pad 變大把鄰近氣泡文字吃進來。
+     */
     private fun recognizeOne(page: Bitmap, line: TextLine, bicubic: Boolean) {
-        // ★ 先外擴、再 sortPnts：sortPnts 定的點序是 warp 要的，擴完才排才不會亂序（擴張本身不改直/橫書判定）。
-        val quad = if (cfg.stripPad > 0) expandQuad(line.quad, cfg.stripPad, page.width, page.height) else line.quad
-        val (ordered, isV) = sortPnts(quad)
-        line.direction = if (isV) "v" else "h"
-        val strip = transformedRegion(page, ordered, isV, cfg.textHeight, bicubic) ?: return
-        if (cfg.ignoreBubble in 1..50 && isIgnore(strip, cfg.ignoreBubble)) {
-            strip.recycle()  // 彩色/非氣泡 SFX 類文字 → 跳過
-            return
+        val primary = recognizeCandidate(page, line, bicubic, cfg.stripPad) ?: return
+        line.direction = if (primary.vertical) "v" else "h"
+
+        if (primary.ignored) return
+
+        var best = primary
+        val shouldRescue =
+            cfg.rescuePad > cfg.stripPad &&
+                (
+                    primary.text.isBlank() ||
+                        primary.prob < cfg.rescueBelowProb ||
+                        looksLikeMixedAlphaNumericNoise(primary.text)
+                    )
+
+        if (shouldRescue) {
+            val rescue = recognizeCandidate(page, line, bicubic, cfg.rescuePad)
+            if (
+                rescue != null &&
+                !rescue.ignored &&
+                rescue.text.isNotBlank() &&
+                (
+                    rescue.prob >= primary.prob + cfg.rescueMinGain ||
+                        (primary.text.isBlank() && rescue.prob >= cfg.minProb)
+                    )
+            ) {
+                best = rescue
+                line.direction = if (rescue.vertical) "v" else "h"
+                EngineTrace.log(
+                    "ocr.rescue pad=${cfg.stripPad}->${cfg.rescuePad} " +
+                        "p=${"%.3f".format(primary.prob)}->${"%.3f".format(rescue.prob)}",
+                )
+            }
         }
+
+        if (best.prob >= cfg.minProb) line.text = best.text
+    }
+
+    private data class OcrCandidateResult(
+        val text: String,
+        val prob: Float,
+        val vertical: Boolean,
+        val ignored: Boolean = false,
+    )
+
+    private fun recognizeCandidate(
+        page: Bitmap,
+        line: TextLine,
+        bicubic: Boolean,
+        pad: Int,
+    ): OcrCandidateResult? {
+        // 先外擴、再 sortPnts：sortPnts 定的點序是 warp 要的，擴完才排才不會亂序。
+        val quad = if (pad > 0) expandQuad(line.quad, pad, page.width, page.height) else line.quad
+        val (ordered, isV) = sortPnts(quad)
+        val strip = transformedRegion(page, ordered, isV, cfg.textHeight, bicubic) ?: return null
+
         try {
+            if (cfg.ignoreBubble in 1..50 && isIgnore(strip, cfg.ignoreBubble)) {
+                return OcrCandidateResult("", 0f, isV, ignored = true)
+            }
             val (text, prob) = infer(stripToChw(strip))
-            if (prob >= cfg.minProb) line.text = text  // 低信心誤讀 → 丟
+            return OcrCandidateResult(text.trim(), prob, isV)
         } catch (t: Throwable) {
             Log.w(TAG, "OCR 單行失敗：${t.message}")
+            return null
         } finally {
             strip.recycle()
         }
     }
+
+    /**
+     * OCR 偶爾把英文單詞中的 O/I/S 誤成 0/1/5（例如 S09）。這裡不直接修改文字，只觸發一次較寬裁切重試。
+     */
+    private fun looksLikeMixedAlphaNumericNoise(text: String): Boolean =
+        Regex("""(?i)\\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\\d)[a-z0-9]{3,}\\b""").containsMatchIn(text)
 
     /** 前處理好的一條：[chw]=[3,h,w]。 */
     private class Chw(val chw: FloatArray, val w: Int, val h: Int)
