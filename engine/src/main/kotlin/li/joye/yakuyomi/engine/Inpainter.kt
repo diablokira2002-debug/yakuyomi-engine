@@ -78,7 +78,12 @@ class Inpainter(
         val maskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         maskBmp.setPixels(maskPx, 0, w, 0, 0, w, h)
         try {
-            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+            // Failure must reach Pipeline as PageResult.Failed. Previously a null AOT
+            // result silently returned the ORIGINAL English picture and Renderer drew
+            // Arabic ON TOP of the unchanged source lettering (the reported bug).
+            val inpainted = runWholeAot(page, maskBmp, w, h)
+                ?: throw IllegalStateException("AOT inpaint failed; preserving original page for retry")
+            compositePixels(result, maskPx, inpainted)
         } finally {
             maskBmp.recycle()
         }
